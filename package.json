@@ -1,9 +1,18 @@
 {
-  "name": "backend",
+  "name": "sistem-monitoring-suhu",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Sistem monitoring suhu dengan ESP32, MQTT, dan database buffer",
+  "main": "src/server/server.mjs",
   "scripts": {
+    "start": "node src/server/server.mjs",
+    "dev": "nodemon src/server/server.mjs",
+    "db:generate": "npx prisma generate",
+    "db:push": "npx prisma db push",
+    "db:migrate": "npx prisma migrate dev",
+    "db:studio": "npx prisma studio",
+    "db:reset": "npx prisma migrate reset",
+    "export:manual": "node scripts/manual-export.mjs",
+    "setup": "npm install && npm run db:generate && npm run db:push",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -11,10 +20,16 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@prisma/client": "^6.14.0",
     "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "exceljs": "^4.4.0",
     "express": "^5.1.0",
     "mqtt": "^5.14.0",
     "socket.io": "^4.8.1",
     "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
   }
 }

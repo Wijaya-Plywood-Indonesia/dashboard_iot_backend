@@ -1,0 +1,65 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+// Tabel untuk menyimpan data suhu mentah (buffer 1 menit)
+model TemperatureBuffer {
+  id          Int      @id @default(autoincrement())
+  temperature Float    @map("suhu")
+  timestamp   DateTime @default(now()) @map("waktu_catat")
+  isProcessed Boolean  @default(false) @map("sudah_diproses")
+  
+  @@map("buffer_suhu")
+}
+
+// Tabel untuk menyimpan data agregasi 10 menit
+model TemperatureAggregate {
+  id              Int      @id @default(autoincrement())
+  date            DateTime @map("tanggal")
+  timeSlot        String   @map("slot_waktu") // "00:00-00:10", "00:10-00:20", dst
+  meanTemp        Float    @map("suhu_rata")
+  medianTemp      Float    @map("suhu_median") 
+  modeTemp        Float    @map("suhu_modus")
+  minTemp         Float    @map("suhu_minimum")
+  maxTemp         Float    @map("suhu_maksimum")
+  sampleCount     Int      @map("jumlah_sample")
+  createdAt       DateTime @default(now()) @map("dibuat_pada")
+  isExported      Boolean  @default(false) @map("sudah_dieksport")
+  
+  @@unique([date, timeSlot])
+  @@map("agregasi_suhu")
+}
+
+// Tabel untuk backup data harian (setelah export)
+model DailyTemperatureBackup {
+  id              Int      @id @default(autoincrement())
+  date            String   @unique @map("tanggal") // Format: "2024-01-15"
+  csvFilePath     String?  @map("file_csv")
+  excelFilePath   String?  @map("file_excel")
+  totalRecords    Int      @map("total_record")
+  avgDailyTemp    Float    @map("rata_suhu_harian")
+  minDailyTemp    Float    @map("min_suhu_harian")
+  maxDailyTemp    Float    @map("max_suhu_harian")
+  exportedAt      DateTime @default(now()) @map("dieksport_pada")
+  
+  @@map("backup_harian")
+}
+
+// Tabel untuk log sistem dan error handling
+model SystemLog {
+  id        Int      @id @default(autoincrement())
+  level     String   @map("tingkat") // "INFO", "WARNING", "ERROR"
+  message   String   @map("pesan")
+  metadata  String?  @map("data_tambahan") // JSON string untuk data tambahan
+  timestamp DateTime @default(now()) @map("waktu")
+  
+  @@map("log_sistem")
+}
