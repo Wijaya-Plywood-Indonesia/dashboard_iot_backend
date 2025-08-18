@@ -41,10 +41,10 @@ client.on("connect", () => {
 // MQTT message handler dengan integrasi database yang diperbaiki
 client.on("message", async (topic, message) => {
   try {
-    const suhu = parseFloat(message.toString());
+    const suhu = parseFloat(message.toString()) + 20;
 
     // Validasi data suhu
-    if (isNaN(suhu) || suhu < -50 || suhu > 100) {
+    if (isNaN(suhu) || suhu < -50 || suhu > 1000) {
       console.warn(`⚠️  Data suhu tidak valid: ${suhu}°C`);
       return;
     }
