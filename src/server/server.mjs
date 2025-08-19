@@ -19,7 +19,7 @@ const io = new Server(server, {
 const tempService = new TemperatureService();
 
 // MQTT config
-const client = mqtt.connect("mqtt://broker.emqx.io:1883");
+const client = mqtt.connect("mqtt://broker.hivemq.com:1883");
 const topic = "esp32/suhu";
 
 let lastTemp = 0;
@@ -41,10 +41,11 @@ client.on("connect", () => {
 // MQTT message handler dengan integrasi database yang diperbaiki
 client.on("message", async (topic, message) => {
   try {
-    const suhu = parseFloat(message.toString()) + 20;
+    const suhu = parseFloat(message.toString());
 
     // Validasi data suhu
     if (isNaN(suhu) || suhu < -50 || suhu > 1000) {
+      // Konfigurasikan lebih lanjut dengan data asli
       console.warn(`⚠️  Data suhu tidak valid: ${suhu}°C`);
       return;
     }
