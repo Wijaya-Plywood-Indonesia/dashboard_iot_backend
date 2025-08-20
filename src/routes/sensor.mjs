@@ -14,7 +14,7 @@ router.get("/current", SensorController.getCurrentTemperature);
 // GET /api/sensor/aggregate/today - Ambil data agregasi hari ini
 router.get("/aggregate/today", SensorController.getTodayAggregate);
 
-// GET /api/sensor/buffer/count - Status buffer
+// GET /api/sensor/buffer/status - Status buffer (PERBAIKAN: konsisten dengan controller)
 router.get("/buffer/status", SensorController.getBufferStatus);
 
 // GET /api/sensor/history/:date - Data historis berdasarkan tanggal

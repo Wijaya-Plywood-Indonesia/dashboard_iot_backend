@@ -63,3 +63,10 @@ model SystemLog {
   
   @@map("log_sistem")
 }
+
+// Model untuk sistem login
+model User {
+  user_id Int @id @default(autoincrement())
+  username String @unique
+  password String
+}

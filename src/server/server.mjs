@@ -5,6 +5,8 @@ import mqtt from "mqtt";
 import cors from "cors";
 import { Server } from "socket.io";
 import { TemperatureService } from "../services/dataService.mjs";
+import sensorRoutes from "../routes/sensor.mjs";
+import authRoutes from "../routes/auth.mjs"; // PERUBAHAN: Import rute autentikasi
 
 const app = express();
 app.use(cors());
@@ -17,6 +19,12 @@ const io = new Server(server, {
 
 // Inisialisasi service temperature
 const tempService = new TemperatureService();
+
+// PERUBAHAN: Gunakan rute autentikasi
+app.use("/api/auth", authRoutes);
+
+// Gunakan rute sensor
+app.use("/api/sensor", sensorRoutes);
 
 // MQTT config
 const client = mqtt.connect("mqtt://broker.hivemq.com:1883");
@@ -41,34 +49,29 @@ client.on("connect", () => {
 // MQTT message handler dengan integrasi database yang diperbaiki
 client.on("message", async (topic, message) => {
   try {
-    const suhu = parseFloat(message.toString());
+    const suhu = parseFloat(message.toString()); // Validasi data suhu
 
-    // Validasi data suhu
     if (isNaN(suhu) || suhu < -50 || suhu > 1000) {
-      // Konfigurasikan lebih lanjut dengan data asli
-      console.warn(`⚠️  Data suhu tidak valid: ${suhu}°C`);
+      console.warn(`⚠️  Data suhu tidak valid: ${suhu}°C`);
       return;
     }
 
     lastTemp = suhu;
-    console.log(`🌡️  Data MQTT: ${suhu}°C`);
+    console.log(`🌡️  Data MQTT: ${suhu}°C`); // PERBAIKAN: Gunakan receiveTemperatureData alih-alih saveTemperatureToBuffer
 
-    // PERBAIKAN: Gunakan receiveTemperatureData alih-alih saveTemperatureToBuffer
     const result = await tempService.receiveTemperatureData(suhu);
 
     if (result.success) {
       console.log(`📊 Buffer size: ${result.bufferSize}`);
-    }
+    } // Broadcast ke React via Socket.IO
 
-    // Broadcast ke React via Socket.IO
     io.emit("suhu", {
       temperature: suhu,
       timestamp: new Date().toISOString(),
       status: "connected",
       bufferSize: result.bufferSize,
-    });
+    }); // Emit juga ke channel khusus untuk real-time charts
 
-    // Emit juga ke channel khusus untuk real-time charts
     io.emit("temperatureData", {
       value: suhu,
       time: Date.now(),
@@ -103,9 +106,8 @@ client.on("close", () => {
 
 // Socket.IO connection handling
 io.on("connection", (socket) => {
-  console.log(`👤 Client terhubung: ${socket.id}`);
+  console.log(`👤 Client terhubung: ${socket.id}`); // Kirim data terakhir saat client connect
 
-  // Kirim data terakhir saat client connect
   socket.emit("suhu", {
     temperature: lastTemp,
     timestamp: new Date().toISOString(),
@@ -114,9 +116,8 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     console.log(`👤 Client terputus: ${socket.id}`);
-  });
+  }); // Handle request untuk data historis
 
-  // Handle request untuk data historis
   socket.on("requestHistoricalData", async (dateRange) => {
     try {
       const historicalData = await tempService.getHistoricalData(dateRange);
@@ -124,9 +125,8 @@ io.on("connection", (socket) => {
     } catch (error) {
       socket.emit("error", { message: "Gagal mengambil data historis" });
     }
-  });
+  }); // Handle request untuk system status
 
-  // Handle request untuk system status
   socket.on("requestSystemStatus", async () => {
     try {
       const status = await tempService.getSystemStatus();
@@ -138,7 +138,7 @@ io.on("connection", (socket) => {
 });
 
 // ===========================================
-// REST API ENDPOINTS
+// REST API ENDPOINTS (Legacy - untuk backward compatibility)
 // ===========================================
 
 // GET - Ambil suhu terakhir (legacy endpoint)
@@ -148,6 +148,72 @@ app.get("/api/suhu", (req, res) => {
     timestamp: new Date().toISOString(),
     status: "ok",
   });
+});
+
+// PERBAIKAN: Tambahkan endpoint untuk aggregate today sebagai fallback
+app.get("/api/aggregate/today", async (req, res) => {
+  try {
+    // Redirect ke sensor route yang benar
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const { PrismaClient } = await import("@prisma/client");
+    const prisma = new PrismaClient();
+
+    const aggregateData = await prisma.temperatureAggregate.findMany({
+      where: {
+        date: {
+          gte: today,
+          lt: tomorrow,
+        },
+      },
+      orderBy: { timeSlot: "asc" },
+    });
+
+    await prisma.$disconnect();
+
+    if (aggregateData.length === 0) {
+      return res.json({
+        success: true,
+        message: "Belum ada data agregasi untuk hari ini",
+        data: { aggregates: [] },
+      });
+    } // Hitung statistik harian
+
+    const dailyStats = {
+      totalSlots: aggregateData.length,
+      avgTemp:
+        aggregateData.reduce((sum, item) => sum + item.meanTemp, 0) /
+        aggregateData.length,
+      maxTemp: Math.max(...aggregateData.map((item) => item.maxTemp)),
+      minTemp: Math.min(...aggregateData.map((item) => item.minTemp)),
+      totalSamples: aggregateData.reduce(
+        (sum, item) => sum + item.sampleCount,
+        0
+      ),
+    };
+
+    res.json({
+      success: true,
+      message: "Data agregasi hari ini berhasil diambil",
+      data: {
+        aggregates: aggregateData,
+        dailyStats: {
+          ...dailyStats,
+          avgTemp: Math.round(dailyStats.avgTemp * 100) / 100,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error getting today aggregate:", error);
+    res.status(500).json({
+      success: false,
+      message: "Gagal mengambil data agregasi hari ini",
+      error: error.message,
+    });
+  }
 });
 
 // GET - Status sistem real-time
@@ -370,25 +436,28 @@ app.use((req, res) => {
       "GET /api/logs",
       "GET /api/backup",
       "GET /api/health",
+      "GET /api/sensor/current",
+      "GET /api/sensor/aggregate/today",
+      "GET /api/sensor/realtime/stats",
+      "GET /api/sensor/history/:date",
       "POST /api/debug/process-buffer",
       "POST /api/debug/process-aggregate",
+      "POST /api/auth/register", // PERUBAHAN: Tambah endpoint register
+      "POST /api/auth/login", // PERUBAHAN: Tambah endpoint login
     ],
   });
 });
 
 // Graceful shutdown handling
 process.on("SIGTERM", async () => {
-  console.log("🔄 SIGTERM received, shutting down gracefully");
+  console.log("🔄 SIGTERM received, shutting down gracefully"); // Close MQTT connection
 
-  // Close MQTT connection
   if (client.connected) {
     client.end();
-  }
+  } // Cleanup temperature service
 
-  // Cleanup temperature service
-  await tempService.cleanup();
+  await tempService.cleanup(); // Close server
 
-  // Close server
   server.close(() => {
     console.log("✅ Server closed gracefully");
     process.exit(0);
@@ -396,17 +465,14 @@ process.on("SIGTERM", async () => {
 });
 
 process.on("SIGINT", async () => {
-  console.log("🔄 SIGINT received, shutting down gracefully");
+  console.log("🔄 SIGINT received, shutting down gracefully"); // Close MQTT connection
 
-  // Close MQTT connection
   if (client.connected) {
     client.end();
-  }
+  } // Cleanup temperature service
 
-  // Cleanup temperature service
-  await tempService.cleanup();
+  await tempService.cleanup(); // Close server
 
-  // Close server
   server.close(() => {
     console.log("✅ Server closed gracefully");
     process.exit(0);
@@ -431,7 +497,13 @@ server.listen(PORT, () => {
   console.log(`🏥 Health Check: http://localhost:${PORT}/api/health`);
   console.log(`📋 System Logs: http://localhost:${PORT}/api/logs`);
   console.log("");
+  console.log("🔧 Sensor Endpoints:");
+  console.log(`   GET http://localhost:${PORT}/api/sensor/current`);
+  console.log(`   GET http://localhost:${PORT}/api/sensor/aggregate/today`);
+  console.log(`   GET http://localhost:${PORT}/api/sensor/realtime/stats`);
+  console.log(`   GET http://localhost:${PORT}/api/sensor/history/YYYY-MM-DD`);
+  console.log("");
   console.log("🔧 Debug Endpoints:");
-  console.log(`   POST http://localhost:${PORT}/api/debug/process-buffer`);
-  console.log(`   POST http://localhost:${PORT}/api/debug/process-aggregate`);
+  console.log(`   POST http://localhost:${PORT}/api/debug/process-buffer`);
+  console.log(`   POST http://localhost:${PORT}/api/debug/process-aggregate`);
 });

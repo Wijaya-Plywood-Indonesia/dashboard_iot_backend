@@ -1,4 +1,4 @@
-// src/controllers/sensor.mjs
+// src/controllers/dataControllers.mjs
 import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
@@ -63,7 +63,7 @@ export class SensorController {
         return res.json({
           success: true,
           message: "Belum ada data agregasi untuk hari ini",
-          data: [],
+          data: { aggregates: [] },
         });
       }
 
@@ -102,7 +102,7 @@ export class SensorController {
     }
   }
 
-  // GET /api/sensor/buffer/count - Ambil jumlah data di buffer
+  // GET /api/sensor/buffer/status - Ambil status buffer
   static async getBufferStatus(req, res) {
     try {
       const bufferCount = await prisma.temperatureBuffer.count({
