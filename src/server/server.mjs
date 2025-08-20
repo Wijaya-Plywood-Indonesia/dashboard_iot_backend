@@ -3,10 +3,12 @@ import express from "express";
 import http from "http";
 import mqtt from "mqtt";
 import cors from "cors";
+import path from "path";
 import { Server } from "socket.io";
 import { TemperatureService } from "../services/dataService.mjs";
 import sensorRoutes from "../routes/sensor.mjs";
-import authRoutes from "../routes/auth.mjs"; // PERUBAHAN: Import rute autentikasi
+import authRoutes from "../routes/auth.mjs";
+import { verifyToken, optionalAuth } from "../middleware/authMiddleware.mjs";
 
 const app = express();
 app.use(cors());
@@ -20,11 +22,11 @@ const io = new Server(server, {
 // Inisialisasi service temperature
 const tempService = new TemperatureService();
 
-// PERUBAHAN: Gunakan rute autentikasi
+// AUTHENTICATION ROUTES (Public - tidak perlu proteksi)
 app.use("/api/auth", authRoutes);
 
-// Gunakan rute sensor
-app.use("/api/sensor", sensorRoutes);
+// SENSOR ROUTES (Protected - perlu token)
+app.use("/api/sensor", verifyToken, sensorRoutes);
 
 // MQTT config
 const client = mqtt.connect("mqtt://broker.hivemq.com:1883");
@@ -49,29 +51,31 @@ client.on("connect", () => {
 // MQTT message handler dengan integrasi database yang diperbaiki
 client.on("message", async (topic, message) => {
   try {
-    const suhu = parseFloat(message.toString()); // Validasi data suhu
+    const suhu = parseFloat(message.toString());
 
     if (isNaN(suhu) || suhu < -50 || suhu > 1000) {
-      console.warn(`⚠️  Data suhu tidak valid: ${suhu}°C`);
+      console.warn(`⚠️  Data suhu tidak valid: ${suhu}°C`);
       return;
     }
 
     lastTemp = suhu;
-    console.log(`🌡️  Data MQTT: ${suhu}°C`); // PERBAIKAN: Gunakan receiveTemperatureData alih-alih saveTemperatureToBuffer
+    console.log(`🌡️  Data MQTT: ${suhu}°C`);
 
     const result = await tempService.receiveTemperatureData(suhu);
 
     if (result.success) {
       console.log(`📊 Buffer size: ${result.bufferSize}`);
-    } // Broadcast ke React via Socket.IO
+    }
 
+    // Broadcast ke React via Socket.IO
     io.emit("suhu", {
       temperature: suhu,
       timestamp: new Date().toISOString(),
       status: "connected",
       bufferSize: result.bufferSize,
-    }); // Emit juga ke channel khusus untuk real-time charts
+    });
 
+    // Emit juga ke channel khusus untuk real-time charts
     io.emit("temperatureData", {
       value: suhu,
       time: Date.now(),
@@ -106,8 +110,9 @@ client.on("close", () => {
 
 // Socket.IO connection handling
 io.on("connection", (socket) => {
-  console.log(`👤 Client terhubung: ${socket.id}`); // Kirim data terakhir saat client connect
+  console.log(`👤 Client terhubung: ${socket.id}`);
 
+  // Kirim data terakhir saat client connect
   socket.emit("suhu", {
     temperature: lastTemp,
     timestamp: new Date().toISOString(),
@@ -116,8 +121,9 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     console.log(`👤 Client terputus: ${socket.id}`);
-  }); // Handle request untuk data historis
+  });
 
+  // Handle request untuk data historis
   socket.on("requestHistoricalData", async (dateRange) => {
     try {
       const historicalData = await tempService.getHistoricalData(dateRange);
@@ -125,8 +131,9 @@ io.on("connection", (socket) => {
     } catch (error) {
       socket.emit("error", { message: "Gagal mengambil data historis" });
     }
-  }); // Handle request untuk system status
+  });
 
+  // Handle request untuk system status
   socket.on("requestSystemStatus", async () => {
     try {
       const status = await tempService.getSystemStatus();
@@ -138,22 +145,25 @@ io.on("connection", (socket) => {
 });
 
 // ===========================================
-// REST API ENDPOINTS (Legacy - untuk backward compatibility)
+// PROTECTED REST API ENDPOINTS
 // ===========================================
 
-// GET - Ambil suhu terakhir (legacy endpoint)
-app.get("/api/suhu", (req, res) => {
+// GET - Ambil suhu terakhir (PROTECTED)
+app.get("/api/suhu", verifyToken, (req, res) => {
+  console.log(`📊 Temperature data requested by user: ${req.user.username}`);
   res.json({
     suhu: lastTemp,
     timestamp: new Date().toISOString(),
     status: "ok",
+    requestedBy: req.user.username,
   });
 });
 
-// PERBAIKAN: Tambahkan endpoint untuk aggregate today sebagai fallback
-app.get("/api/aggregate/today", async (req, res) => {
+// GET - Aggregate today (PROTECTED)
+app.get("/api/aggregate/today", verifyToken, async (req, res) => {
   try {
-    // Redirect ke sensor route yang benar
+    console.log(`📈 Aggregate data requested by user: ${req.user.username}`);
+
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
@@ -179,8 +189,9 @@ app.get("/api/aggregate/today", async (req, res) => {
         success: true,
         message: "Belum ada data agregasi untuk hari ini",
         data: { aggregates: [] },
+        requestedBy: req.user.username,
       });
-    } // Hitung statistik harian
+    }
 
     const dailyStats = {
       totalSlots: aggregateData.length,
@@ -205,6 +216,7 @@ app.get("/api/aggregate/today", async (req, res) => {
           avgTemp: Math.round(dailyStats.avgTemp * 100) / 100,
         },
       },
+      requestedBy: req.user.username,
     });
   } catch (error) {
     console.error("Error getting today aggregate:", error);
@@ -216,9 +228,11 @@ app.get("/api/aggregate/today", async (req, res) => {
   }
 });
 
-// GET - Status sistem real-time
-app.get("/api/system/status", async (req, res) => {
+// GET - Status sistem real-time (PROTECTED)
+app.get("/api/system/status", verifyToken, async (req, res) => {
   try {
+    console.log(`🔧 System status requested by user: ${req.user.username}`);
+
     const status = await tempService.getSystemStatus();
     res.json({
       success: true,
@@ -229,6 +243,7 @@ app.get("/api/system/status", async (req, res) => {
         serverUptime: process.uptime(),
         timestamp: new Date().toISOString(),
       },
+      requestedBy: req.user.username,
     });
   } catch (error) {
     res.status(500).json({
@@ -239,13 +254,16 @@ app.get("/api/system/status", async (req, res) => {
   }
 });
 
-// POST - Force process buffer (untuk debugging)
-app.post("/api/debug/process-buffer", async (req, res) => {
+// POST - Force process buffer (PROTECTED)
+app.post("/api/debug/process-buffer", verifyToken, async (req, res) => {
   try {
+    console.log(`🔧 Buffer processing forced by user: ${req.user.username}`);
+
     await tempService.forceProcessBuffer();
     res.json({
       success: true,
       message: "Buffer berhasil diproses secara manual",
+      processedBy: req.user.username,
     });
   } catch (error) {
     res.status(500).json({
@@ -256,13 +274,16 @@ app.post("/api/debug/process-buffer", async (req, res) => {
   }
 });
 
-// POST - Force process aggregate (untuk debugging)
-app.post("/api/debug/process-aggregate", async (req, res) => {
+// POST - Force process aggregate (PROTECTED)
+app.post("/api/debug/process-aggregate", verifyToken, async (req, res) => {
   try {
+    console.log(`🔧 Aggregate processing forced by user: ${req.user.username}`);
+
     await tempService.forceProcessAggregate();
     res.json({
       success: true,
       message: "Agregasi berhasil diproses secara manual",
+      processedBy: req.user.username,
     });
   } catch (error) {
     res.status(500).json({
@@ -273,9 +294,13 @@ app.post("/api/debug/process-aggregate", async (req, res) => {
   }
 });
 
-// GET - Ambil data backup berdasarkan tanggal
-app.get("/api/backup/:date", async (req, res) => {
+// GET - Ambil data backup berdasarkan tanggal (PROTECTED)
+app.get("/api/backup/:date", verifyToken, async (req, res) => {
   try {
+    console.log(
+      `📁 Backup data requested by user: ${req.user.username} for date: ${req.params.date}`
+    );
+
     const { date } = req.params;
     const backupData = await tempService.getBackupDataByDate(date);
 
@@ -283,15 +308,20 @@ app.get("/api/backup/:date", async (req, res) => {
       return res.status(404).json({ error: backupData.error });
     }
 
-    res.json(backupData);
+    res.json({
+      ...backupData,
+      requestedBy: req.user.username,
+    });
   } catch (error) {
     res.status(500).json({ error: "Gagal mengambil data backup" });
   }
 });
 
-// GET - Ambil daftar tanggal backup yang tersedia
-app.get("/api/backup", async (req, res) => {
+// GET - Ambil daftar tanggal backup yang tersedia (PROTECTED)
+app.get("/api/backup", verifyToken, async (req, res) => {
   try {
+    console.log(`📁 Backup list requested by user: ${req.user.username}`);
+
     const { PrismaClient } = await import("@prisma/client");
     const prisma = new PrismaClient();
 
@@ -308,15 +338,22 @@ app.get("/api/backup", async (req, res) => {
     });
 
     await prisma.$disconnect();
-    res.json(backupList);
+    res.json({
+      data: backupList,
+      requestedBy: req.user.username,
+    });
   } catch (error) {
     res.status(500).json({ error: "Gagal mengambil daftar backup" });
   }
 });
 
-// GET - Download file export (CSV/Excel)
-app.get("/api/download/:type/:date", async (req, res) => {
+// GET - Download file export (PROTECTED)
+app.get("/api/download/:type/:date", verifyToken, async (req, res) => {
   try {
+    console.log(
+      `📥 File download requested by user: ${req.user.username} - ${req.params.type}/${req.params.date}`
+    );
+
     const { type, date } = req.params;
     const backup = await tempService.getBackupDataByDate(date);
 
@@ -337,19 +374,26 @@ app.get("/api/download/:type/:date", async (req, res) => {
   }
 });
 
-// POST - Manual export data (untuk testing)
-app.post("/api/export", async (req, res) => {
+// POST - Manual export data (PROTECTED)
+app.post("/api/export", verifyToken, async (req, res) => {
   try {
+    console.log(`📤 Manual export triggered by user: ${req.user.username}`);
+
     await tempService.exportDailyData();
-    res.json({ message: "Export berhasil dijalankan" });
+    res.json({
+      message: "Export berhasil dijalankan",
+      exportedBy: req.user.username,
+    });
   } catch (error) {
     res.status(500).json({ error: "Export gagal" });
   }
 });
 
-// GET - Ambil statistik sistem
-app.get("/api/stats", async (req, res) => {
+// GET - Ambil statistik sistem (PROTECTED)
+app.get("/api/stats", verifyToken, async (req, res) => {
   try {
+    console.log(`📊 System stats requested by user: ${req.user.username}`);
+
     const { PrismaClient } = await import("@prisma/client");
     const prisma = new PrismaClient();
 
@@ -376,15 +420,18 @@ app.get("/api/stats", async (req, res) => {
       lastTemperature: lastTemp,
       serverUptime: Math.round(process.uptime()),
       lastUpdate: new Date().toISOString(),
+      requestedBy: req.user.username,
     });
   } catch (error) {
     res.status(500).json({ error: "Gagal mengambil statistik" });
   }
 });
 
-// GET - Ambil log sistem
-app.get("/api/logs", async (req, res) => {
+// GET - Ambil log sistem (PROTECTED)
+app.get("/api/logs", verifyToken, async (req, res) => {
   try {
+    console.log(`📋 System logs requested by user: ${req.user.username}`);
+
     const { limit = 50, level } = req.query;
     const { PrismaClient } = await import("@prisma/client");
     const prisma = new PrismaClient();
@@ -398,18 +445,25 @@ app.get("/api/logs", async (req, res) => {
     });
 
     await prisma.$disconnect();
-    res.json(logs);
+    res.json({
+      data: logs,
+      requestedBy: req.user.username,
+    });
   } catch (error) {
     res.status(500).json({ error: "Gagal mengambil log" });
   }
 });
 
-// GET - Health check endpoint
+// ===========================================
+// PUBLIC ENDPOINTS
+// ===========================================
+
+// GET - Health check endpoint (PUBLIC - tidak perlu token)
 app.get("/api/health", (req, res) => {
   res.json({
     status: "healthy",
     mqtt: client.connected ? "connected" : "disconnected",
-    database: "connected", // Prisma akan throw error jika tidak connected
+    database: "connected",
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     timestamp: new Date().toISOString(),
@@ -430,33 +484,38 @@ app.use((req, res) => {
   res.status(404).json({
     error: "Endpoint tidak ditemukan",
     availableEndpoints: [
-      "GET /api/suhu",
-      "GET /api/system/status",
-      "GET /api/stats",
-      "GET /api/logs",
-      "GET /api/backup",
-      "GET /api/health",
-      "GET /api/sensor/current",
-      "GET /api/sensor/aggregate/today",
-      "GET /api/sensor/realtime/stats",
-      "GET /api/sensor/history/:date",
-      "POST /api/debug/process-buffer",
-      "POST /api/debug/process-aggregate",
-      "POST /api/auth/register", // PERUBAHAN: Tambah endpoint register
-      "POST /api/auth/login", // PERUBAHAN: Tambah endpoint login
+      // Public endpoints
+      "GET /api/health (public)",
+      "POST /api/auth/register (public)",
+      "POST /api/auth/login (public)",
+      "GET /api/auth/verify (requires token)",
+      "POST /api/auth/logout (requires token)",
+
+      // Protected endpoints
+      "GET /api/suhu (requires token)",
+      "GET /api/system/status (requires token)",
+      "GET /api/stats (requires token)",
+      "GET /api/logs (requires token)",
+      "GET /api/backup (requires token)",
+      "GET /api/sensor/current (requires token)",
+      "GET /api/sensor/aggregate/today (requires token)",
+      "GET /api/sensor/realtime/stats (requires token)",
+      "GET /api/sensor/history/:date (requires token)",
+      "POST /api/debug/process-buffer (requires token)",
+      "POST /api/debug/process-aggregate (requires token)",
     ],
   });
 });
 
 // Graceful shutdown handling
 process.on("SIGTERM", async () => {
-  console.log("🔄 SIGTERM received, shutting down gracefully"); // Close MQTT connection
+  console.log("🔄 SIGTERM received, shutting down gracefully");
 
   if (client.connected) {
     client.end();
-  } // Cleanup temperature service
+  }
 
-  await tempService.cleanup(); // Close server
+  await tempService.cleanup();
 
   server.close(() => {
     console.log("✅ Server closed gracefully");
@@ -465,13 +524,13 @@ process.on("SIGTERM", async () => {
 });
 
 process.on("SIGINT", async () => {
-  console.log("🔄 SIGINT received, shutting down gracefully"); // Close MQTT connection
+  console.log("🔄 SIGINT received, shutting down gracefully");
 
   if (client.connected) {
     client.end();
-  } // Cleanup temperature service
+  }
 
-  await tempService.cleanup(); // Close server
+  await tempService.cleanup();
 
   server.close(() => {
     console.log("✅ Server closed gracefully");
@@ -492,18 +551,26 @@ process.on("unhandledRejection", (reason, promise) => {
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
-  console.log(`📊 System Status: http://localhost:${PORT}/api/system/status`);
-  console.log(`📈 Dashboard Stats: http://localhost:${PORT}/api/stats`);
   console.log(`🏥 Health Check: http://localhost:${PORT}/api/health`);
-  console.log(`📋 System Logs: http://localhost:${PORT}/api/logs`);
   console.log("");
-  console.log("🔧 Sensor Endpoints:");
-  console.log(`   GET http://localhost:${PORT}/api/sensor/current`);
-  console.log(`   GET http://localhost:${PORT}/api/sensor/aggregate/today`);
-  console.log(`   GET http://localhost:${PORT}/api/sensor/realtime/stats`);
-  console.log(`   GET http://localhost:${PORT}/api/sensor/history/YYYY-MM-DD`);
+  console.log("🔐 Authentication Endpoints:");
+  console.log(`   POST http://localhost:${PORT}/api/auth/register`);
+  console.log(`   POST http://localhost:${PORT}/api/auth/login`);
+  console.log(`   GET  http://localhost:${PORT}/api/auth/verify`);
+  console.log(`   POST http://localhost:${PORT}/api/auth/logout`);
   console.log("");
-  console.log("🔧 Debug Endpoints:");
-  console.log(`   POST http://localhost:${PORT}/api/debug/process-buffer`);
-  console.log(`   POST http://localhost:${PORT}/api/debug/process-aggregate`);
+  console.log("🔧 Protected Sensor Endpoints (requires Bearer token):");
+  console.log(`   GET http://localhost:${PORT}/api/sensor/current`);
+  console.log(`   GET http://localhost:${PORT}/api/sensor/aggregate/today`);
+  console.log(`   GET http://localhost:${PORT}/api/sensor/realtime/stats`);
+  console.log(`   GET http://localhost:${PORT}/api/sensor/history/YYYY-MM-DD`);
+  console.log("");
+  console.log("🔧 Protected System Endpoints (requires Bearer token):");
+  console.log(`   GET http://localhost:${PORT}/api/system/status`);
+  console.log(`   GET http://localhost:${PORT}/api/stats`);
+  console.log(`   GET http://localhost:${PORT}/api/logs`);
+  console.log("");
+  console.log("🔧 Protected Debug Endpoints (requires Bearer token):");
+  console.log(`   POST http://localhost:${PORT}/api/debug/process-buffer`);
+  console.log(`   POST http://localhost:${PORT}/api/debug/process-aggregate`);
 });
