@@ -1,165 +1,211 @@
-// src/server/server.mjs
+import "dotenv/config";
 import express from "express";
 import http from "http";
-import mqtt from "mqtt";
 import cors from "cors";
 import path from "path";
+import helmet from "helmet";
 import { Server } from "socket.io";
 import { TemperatureService } from "../services/dataService.mjs";
+import { MQTTService } from "../services/mqttService.mjs"; // PERBAIKAN: Import MQTTService
 import sensorRoutes from "../routes/sensor.mjs";
 import authRoutes from "../routes/auth.mjs";
-import { verifyToken, optionalAuth } from "../middleware/authMiddleware.mjs";
+import { verifyToken, createRateLimit } from "../middleware/authMiddleware.mjs";
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// Security middleware
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "https:"],
+      },
+    },
+  })
+);
+
+// Rate limiting
+app.use("/api/auth", createRateLimit(15 * 60 * 1000, 10));
+app.use("/api", createRateLimit(15 * 60 * 1000, 1000));
+
+// CORS
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+app.use(express.json({ limit: "10mb" }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: {
+    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    credentials: true,
+  },
 });
 
-// Inisialisasi service temperature
-const tempService = new TemperatureService();
+// PERBAIKAN: Validasi environment variables
+const requiredEnvVars = ["JWT_SECRET"];
+requiredEnvVars.forEach((varName) => {
+  if (!process.env[varName]) {
+    console.error(`🚨 CRITICAL: Environment variable ${varName} is not set!`);
+    process.exit(1);
+  }
+});
 
-// AUTHENTICATION ROUTES (Public - tidak perlu proteksi)
+// PERBAIKAN: Service instances - gunakan class-based services
+let temperatureService;
+let mqttService;
+
+async function initializeServices() {
+  try {
+    console.log("🚀 Initializing services...");
+
+    // 1. Initialize Temperature Service first
+    temperatureService = new TemperatureService();
+    console.log("✅ Temperature service initialized");
+
+    // 2. Initialize MQTT Service with Temperature Service
+    mqttService = new MQTTService(temperatureService);
+    console.log("✅ MQTT service initialized");
+
+    // 3. Set Socket.IO instance to MQTT Service for real-time updates
+    mqttService.setSocketIO(io);
+    console.log("✅ Socket.IO integrated with MQTT service");
+  } catch (error) {
+    console.error("❌ Failed to initialize services:", error);
+    process.exit(1);
+  }
+}
+
+// Routes
 app.use("/api/auth", authRoutes);
-
-// SENSOR ROUTES (Protected - perlu token)
 app.use("/api/sensor", verifyToken, sensorRoutes);
 
-// MQTT config
-const client = mqtt.connect("mqtt://broker.hivemq.com:1883");
-const topic = "esp32/suhu";
+// PERBAIKAN: Socket.IO connection handling dengan service integration
+io.on("connection", (socket) => {
+  console.log(`👤 Client connected: ${socket.id}`);
 
-let lastTemp = 0;
+  // Send current status to new client
+  if (mqttService) {
+    const mqttStatus = mqttService.getStatus();
+    socket.emit("suhu", {
+      temperature: mqttStatus.lastTemperature,
+      timestamp: new Date().toISOString(),
+      status: mqttStatus.connected ? "connected" : "disconnected",
+    });
 
-// MQTT connect
-client.on("connect", () => {
-  console.log("🟢 Terhubung ke MQTT broker");
-  console.log("📡 Subscribe ke topik:", topic);
+    socket.emit("mqttStatus", {
+      status: mqttStatus.connected ? "connected" : "disconnected",
+      brokerUrl: mqttStatus.brokerUrl,
+      topic: mqttStatus.topic,
+    });
+  }
 
-  client.subscribe(topic, (err) => {
-    if (!err) {
-      console.log(`✅ Berhasil subscribe ke topik: ${topic}`);
-    } else {
-      console.error("❌ Error subscribing to topic:", err);
+  socket.on("disconnect", () => {
+    console.log(`👤 Client disconnected: ${socket.id}`);
+  });
+
+  // Handle request for historical data
+  socket.on("requestHistoricalData", async (dateRange) => {
+    try {
+      if (temperatureService) {
+        const historicalData = await temperatureService.getHistoricalData(
+          dateRange
+        );
+        socket.emit("historicalData", historicalData);
+      }
+    } catch (error) {
+      socket.emit("error", { message: "Failed to get historical data" });
+    }
+  });
+
+  // Handle request for system status
+  socket.on("requestSystemStatus", async () => {
+    try {
+      const tempStatus = temperatureService
+        ? await temperatureService.getSystemStatus()
+        : null;
+      const mqttStatus = mqttService ? mqttService.getStatus() : null;
+
+      socket.emit("systemStatus", {
+        temperature: tempStatus,
+        mqtt: mqttStatus,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      socket.emit("error", { message: "Failed to get system status" });
+    }
+  });
+
+  // PERBAIKAN: MQTT control via Socket.IO
+  socket.on("mqttReconnect", () => {
+    try {
+      if (mqttService) {
+        mqttService.forceReconnect();
+        socket.emit("mqttStatus", { status: "reconnecting" });
+      }
+    } catch (error) {
+      socket.emit("error", { message: "Failed to reconnect MQTT" });
     }
   });
 });
 
-// MQTT message handler dengan integrasi database yang diperbaiki
-client.on("message", async (topic, message) => {
+// ===========================================
+// API ENDPOINTS
+// ===========================================
+
+// PERBAIKAN: Status endpoint menggunakan services
+app.get("/api/status", verifyToken, async (req, res) => {
   try {
-    const suhu = parseFloat(message.toString());
+    const tempStatus = temperatureService
+      ? await temperatureService.getSystemStatus()
+      : null;
+    const mqttStatus = mqttService ? mqttService.getStatus() : null;
 
-    if (isNaN(suhu) || suhu < -50 || suhu > 1000) {
-      console.warn(`⚠️  Data suhu tidak valid: ${suhu}°C`);
-      return;
-    }
-
-    lastTemp = suhu;
-    console.log(`🌡️  Data MQTT: ${suhu}°C`);
-
-    const result = await tempService.receiveTemperatureData(suhu);
-
-    if (result.success) {
-      console.log(`📊 Buffer size: ${result.bufferSize}`);
-    }
-
-    // Broadcast ke React via Socket.IO
-    io.emit("suhu", {
-      temperature: suhu,
+    res.json({
+      temperature: tempStatus,
+      mqtt: mqttStatus,
       timestamp: new Date().toISOString(),
-      status: "connected",
-      bufferSize: result.bufferSize,
-    });
-
-    // Emit juga ke channel khusus untuk real-time charts
-    io.emit("temperatureData", {
-      value: suhu,
-      time: Date.now(),
-      bufferSize: result.bufferSize,
     });
   } catch (error) {
-    console.error("❌ Error processing MQTT message:", error);
-    io.emit("suhu", {
-      temperature: lastTemp,
-      timestamp: new Date().toISOString(),
-      status: "error",
-      error: error.message,
+    res.status(500).json({
+      error: "Status check failed",
+      message: error.message,
     });
   }
 });
 
-// Handle MQTT connection errors
-client.on("error", (error) => {
-  console.error("❌ MQTT Connection Error:", error);
-  io.emit("mqttStatus", { status: "disconnected", error: error.message });
-});
-
-client.on("reconnect", () => {
-  console.log("🔄 Reconnecting to MQTT broker...");
-  io.emit("mqttStatus", { status: "reconnecting" });
-});
-
-client.on("close", () => {
-  console.log("📡 MQTT connection closed");
-  io.emit("mqttStatus", { status: "disconnected" });
-});
-
-// Socket.IO connection handling
-io.on("connection", (socket) => {
-  console.log(`👤 Client terhubung: ${socket.id}`);
-
-  // Kirim data terakhir saat client connect
-  socket.emit("suhu", {
-    temperature: lastTemp,
-    timestamp: new Date().toISOString(),
-    status: "connected",
-  });
-
-  socket.on("disconnect", () => {
-    console.log(`👤 Client terputus: ${socket.id}`);
-  });
-
-  // Handle request untuk data historis
-  socket.on("requestHistoricalData", async (dateRange) => {
-    try {
-      const historicalData = await tempService.getHistoricalData(dateRange);
-      socket.emit("historicalData", historicalData);
-    } catch (error) {
-      socket.emit("error", { message: "Gagal mengambil data historis" });
-    }
-  });
-
-  // Handle request untuk system status
-  socket.on("requestSystemStatus", async () => {
-    try {
-      const status = await tempService.getSystemStatus();
-      socket.emit("systemStatus", status);
-    } catch (error) {
-      socket.emit("error", { message: "Gagal mengambil status sistem" });
-    }
-  });
-});
-
-// ===========================================
-// PROTECTED REST API ENDPOINTS
-// ===========================================
-
-// GET - Ambil suhu terakhir (PROTECTED)
+// GET - Current temperature (PROTECTED)
 app.get("/api/suhu", verifyToken, (req, res) => {
   console.log(`📊 Temperature data requested by user: ${req.user.username}`);
+
+  const lastTemp = mqttService ? mqttService.getLastTemperature() : 0;
+  const mqttStatus = mqttService
+    ? mqttService.getStatus()
+    : { connected: false };
+
   res.json({
     suhu: lastTemp,
     timestamp: new Date().toISOString(),
-    status: "ok",
+    status: mqttStatus.connected ? "connected" : "disconnected",
+    mqttInfo: {
+      brokerUrl: mqttStatus.brokerUrl,
+      topic: mqttStatus.topic,
+      reconnectAttempts: mqttStatus.reconnectAttempts,
+    },
     requestedBy: req.user.username,
   });
 });
 
-// GET - Aggregate today (PROTECTED)
+// GET - Today's aggregate data (PROTECTED)
 app.get("/api/aggregate/today", verifyToken, async (req, res) => {
   try {
     console.log(`📈 Aggregate data requested by user: ${req.user.username}`);
@@ -187,7 +233,7 @@ app.get("/api/aggregate/today", verifyToken, async (req, res) => {
     if (aggregateData.length === 0) {
       return res.json({
         success: true,
-        message: "Belum ada data agregasi untuk hari ini",
+        message: "No aggregate data available for today",
         data: { aggregates: [] },
         requestedBy: req.user.username,
       });
@@ -208,7 +254,7 @@ app.get("/api/aggregate/today", verifyToken, async (req, res) => {
 
     res.json({
       success: true,
-      message: "Data agregasi hari ini berhasil diambil",
+      message: "Today's aggregate data retrieved successfully",
       data: {
         aggregates: aggregateData,
         dailyStats: {
@@ -222,24 +268,27 @@ app.get("/api/aggregate/today", verifyToken, async (req, res) => {
     console.error("Error getting today aggregate:", error);
     res.status(500).json({
       success: false,
-      message: "Gagal mengambil data agregasi hari ini",
+      message: "Failed to get today's aggregate data",
       error: error.message,
     });
   }
 });
 
-// GET - Status sistem real-time (PROTECTED)
+// GET - System status (PROTECTED)
 app.get("/api/system/status", verifyToken, async (req, res) => {
   try {
     console.log(`🔧 System status requested by user: ${req.user.username}`);
 
-    const status = await tempService.getSystemStatus();
+    const tempStatus = temperatureService
+      ? await temperatureService.getSystemStatus()
+      : null;
+    const mqttStatus = mqttService ? mqttService.getStatus() : null;
+
     res.json({
       success: true,
       data: {
-        ...status,
-        mqttConnected: client.connected,
-        lastTemperature: lastTemp,
+        temperature: tempStatus,
+        mqtt: mqttStatus,
         serverUptime: process.uptime(),
         timestamp: new Date().toISOString(),
       },
@@ -248,7 +297,7 @@ app.get("/api/system/status", verifyToken, async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      error: "Gagal mengambil status sistem",
+      error: "Failed to get system status",
       message: error.message,
     });
   }
@@ -259,16 +308,24 @@ app.post("/api/debug/process-buffer", verifyToken, async (req, res) => {
   try {
     console.log(`🔧 Buffer processing forced by user: ${req.user.username}`);
 
-    await tempService.forceProcessBuffer();
+    if (!temperatureService) {
+      return res.status(503).json({
+        success: false,
+        error: "Temperature service not initialized",
+      });
+    }
+
+    const result = await temperatureService.forceProcessBuffer();
     res.json({
       success: true,
-      message: "Buffer berhasil diproses secara manual",
+      message: "Buffer processed manually",
+      data: result,
       processedBy: req.user.username,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      error: "Gagal memproses buffer",
+      error: "Failed to process buffer",
       message: error.message,
     });
   }
@@ -279,117 +336,85 @@ app.post("/api/debug/process-aggregate", verifyToken, async (req, res) => {
   try {
     console.log(`🔧 Aggregate processing forced by user: ${req.user.username}`);
 
-    await tempService.forceProcessAggregate();
+    if (!temperatureService) {
+      return res.status(503).json({
+        success: false,
+        error: "Temperature service not initialized",
+      });
+    }
+
+    const result = await temperatureService.forceProcessAggregation();
     res.json({
       success: true,
-      message: "Agregasi berhasil diproses secara manual",
+      message: "Aggregation processed manually",
+      data: result,
       processedBy: req.user.username,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      error: "Gagal memproses agregasi",
+      error: "Failed to process aggregation",
       message: error.message,
     });
   }
 });
 
-// GET - Ambil data backup berdasarkan tanggal (PROTECTED)
-app.get("/api/backup/:date", verifyToken, async (req, res) => {
+// POST - Force MQTT reconnect (PROTECTED)
+app.post("/api/debug/mqtt-reconnect", verifyToken, async (req, res) => {
   try {
-    console.log(
-      `📁 Backup data requested by user: ${req.user.username} for date: ${req.params.date}`
-    );
+    console.log(`🔧 MQTT reconnect forced by user: ${req.user.username}`);
 
-    const { date } = req.params;
-    const backupData = await tempService.getBackupDataByDate(date);
-
-    if (backupData.error) {
-      return res.status(404).json({ error: backupData.error });
+    if (!mqttService) {
+      return res.status(503).json({
+        success: false,
+        error: "MQTT service not initialized",
+      });
     }
 
+    mqttService.forceReconnect();
+
     res.json({
-      ...backupData,
+      success: true,
+      message: "MQTT reconnection initiated",
+      processedBy: req.user.username,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: "Failed to reconnect MQTT",
+      message: error.message,
+    });
+  }
+});
+
+// GET - MQTT status detail (PROTECTED)
+app.get("/api/mqtt/status", verifyToken, async (req, res) => {
+  try {
+    console.log(`📡 MQTT status requested by user: ${req.user.username}`);
+
+    if (!mqttService) {
+      return res.status(503).json({
+        error: "MQTT service not initialized",
+      });
+    }
+
+    const status = mqttService.getStatus();
+
+    res.json({
+      success: true,
+      data: status,
       requestedBy: req.user.username,
     });
   } catch (error) {
-    res.status(500).json({ error: "Gagal mengambil data backup" });
-  }
-});
-
-// GET - Ambil daftar tanggal backup yang tersedia (PROTECTED)
-app.get("/api/backup", verifyToken, async (req, res) => {
-  try {
-    console.log(`📁 Backup list requested by user: ${req.user.username}`);
-
-    const { PrismaClient } = await import("@prisma/client");
-    const prisma = new PrismaClient();
-
-    const backupList = await prisma.dailyTemperatureBackup.findMany({
-      select: {
-        date: true,
-        totalRecords: true,
-        avgDailyTemp: true,
-        minDailyTemp: true,
-        maxDailyTemp: true,
-        exportedAt: true,
-      },
-      orderBy: { date: "desc" },
+    res.status(500).json({
+      success: false,
+      error: "Failed to get MQTT status",
+      message: error.message,
     });
-
-    await prisma.$disconnect();
-    res.json({
-      data: backupList,
-      requestedBy: req.user.username,
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Gagal mengambil daftar backup" });
   }
 });
 
-// GET - Download file export (PROTECTED)
-app.get("/api/download/:type/:date", verifyToken, async (req, res) => {
-  try {
-    console.log(
-      `📥 File download requested by user: ${req.user.username} - ${req.params.type}/${req.params.date}`
-    );
-
-    const { type, date } = req.params;
-    const backup = await tempService.getBackupDataByDate(date);
-
-    if (backup.error) {
-      return res.status(404).json({ error: backup.error });
-    }
-
-    const filePath = type === "csv" ? backup.csvFilePath : backup.excelFilePath;
-
-    if (!filePath) {
-      return res.status(404).json({ error: "File tidak ditemukan" });
-    }
-
-    const fileName = path.basename(filePath);
-    res.download(filePath, fileName);
-  } catch (error) {
-    res.status(500).json({ error: "Gagal mendownload file" });
-  }
-});
-
-// POST - Manual export data (PROTECTED)
-app.post("/api/export", verifyToken, async (req, res) => {
-  try {
-    console.log(`📤 Manual export triggered by user: ${req.user.username}`);
-
-    await tempService.exportDailyData();
-    res.json({
-      message: "Export berhasil dijalankan",
-      exportedBy: req.user.username,
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Export gagal" });
-  }
-});
-
-// GET - Ambil statistik sistem (PROTECTED)
+// GET - System statistics (PROTECTED)
 app.get("/api/stats", verifyToken, async (req, res) => {
   try {
     console.log(`📊 System stats requested by user: ${req.user.username}`);
@@ -407,7 +432,10 @@ app.get("/api/stats", verifyToken, async (req, res) => {
 
     await prisma.$disconnect();
 
-    const systemStatus = await tempService.getSystemStatus();
+    const tempStatus = temperatureService
+      ? await temperatureService.getSystemStatus()
+      : null;
+    const mqttStatus = mqttService ? mqttService.getStatus() : null;
 
     res.json({
       totalBufferCount: stats[0],
@@ -415,128 +443,98 @@ app.get("/api/stats", verifyToken, async (req, res) => {
       aggregateCount: stats[2],
       backupCount: stats[3],
       errorCount: stats[4],
-      systemStatus,
-      mqttConnected: client.connected,
-      lastTemperature: lastTemp,
+      temperatureService: tempStatus,
+      mqttService: mqttStatus,
       serverUptime: Math.round(process.uptime()),
       lastUpdate: new Date().toISOString(),
       requestedBy: req.user.username,
     });
   } catch (error) {
-    res.status(500).json({ error: "Gagal mengambil statistik" });
+    res.status(500).json({ error: "Failed to get statistics" });
   }
 });
 
-// GET - Ambil log sistem (PROTECTED)
-app.get("/api/logs", verifyToken, async (req, res) => {
-  try {
-    console.log(`📋 System logs requested by user: ${req.user.username}`);
-
-    const { limit = 50, level } = req.query;
-    const { PrismaClient } = await import("@prisma/client");
-    const prisma = new PrismaClient();
-
-    const whereClause = level ? { level: level.toUpperCase() } : {};
-
-    const logs = await prisma.systemLog.findMany({
-      where: whereClause,
-      orderBy: { timestamp: "desc" },
-      take: parseInt(limit),
-    });
-
-    await prisma.$disconnect();
-    res.json({
-      data: logs,
-      requestedBy: req.user.username,
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Gagal mengambil log" });
-  }
-});
-
-// ===========================================
-// PUBLIC ENDPOINTS
-// ===========================================
-
-// GET - Health check endpoint (PUBLIC - tidak perlu token)
+// GET - Health check (PUBLIC)
 app.get("/api/health", (req, res) => {
+  const mqttStatus = mqttService ? mqttService.getStatus() : null;
+  const lastTemp = mqttService ? mqttService.getLastTemperature() : 0;
+
   res.json({
     status: "healthy",
-    mqtt: client.connected ? "connected" : "disconnected",
-    database: "connected",
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
+    services: {
+      temperature: temperatureService ? "initialized" : "not_initialized",
+      mqtt: mqttStatus
+        ? mqttStatus.connected
+          ? "connected"
+          : "disconnected"
+        : "not_initialized",
+    },
+    lastTemperature: lastTemp,
     timestamp: new Date().toISOString(),
+    version: "1.0.0",
   });
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error("❌ Server Error:", error);
+
+  const isDevelopment = process.env.NODE_ENV === "development";
+
   res.status(500).json({
     error: "Internal server error",
-    message: error.message,
+    ...(isDevelopment && {
+      message: error.message,
+      stack: error.stack,
+    }),
+    timestamp: new Date().toISOString(),
   });
 });
 
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({
-    error: "Endpoint tidak ditemukan",
+    error: "Endpoint not found",
+    path: req.originalUrl,
+    method: req.method,
     availableEndpoints: [
-      // Public endpoints
       "GET /api/health (public)",
-      "POST /api/auth/register (public)",
-      "POST /api/auth/login (public)",
-      "GET /api/auth/verify (requires token)",
-      "POST /api/auth/logout (requires token)",
-
-      // Protected endpoints
+      "GET /api/status (requires token)",
       "GET /api/suhu (requires token)",
+      "GET /api/mqtt/status (requires token)",
+      "POST /api/debug/mqtt-reconnect (requires token)",
       "GET /api/system/status (requires token)",
       "GET /api/stats (requires token)",
-      "GET /api/logs (requires token)",
-      "GET /api/backup (requires token)",
-      "GET /api/sensor/current (requires token)",
-      "GET /api/sensor/aggregate/today (requires token)",
-      "GET /api/sensor/realtime/stats (requires token)",
-      "GET /api/sensor/history/:date (requires token)",
-      "POST /api/debug/process-buffer (requires token)",
-      "POST /api/debug/process-aggregate (requires token)",
     ],
+    timestamp: new Date().toISOString(),
   });
 });
 
-// Graceful shutdown handling
-process.on("SIGTERM", async () => {
-  console.log("🔄 SIGTERM received, shutting down gracefully");
+// PERBAIKAN: Graceful shutdown dengan proper service cleanup
+async function gracefulShutdown() {
+  console.log("🔄 Shutting down gracefully...");
 
-  if (client.connected) {
-    client.end();
+  // 1. Cleanup MQTT service
+  if (mqttService) {
+    console.log("🧹 Cleaning up MQTT service...");
+    await mqttService.disconnect();
   }
 
-  await tempService.cleanup();
+  // 2. Cleanup temperature service
+  if (temperatureService) {
+    console.log("🧹 Cleaning up temperature service...");
+    await temperatureService.cleanup();
+  }
 
+  // 3. Close HTTP server
   server.close(() => {
     console.log("✅ Server closed gracefully");
     process.exit(0);
   });
-});
+}
 
-process.on("SIGINT", async () => {
-  console.log("🔄 SIGINT received, shutting down gracefully");
-
-  if (client.connected) {
-    client.end();
-  }
-
-  await tempService.cleanup();
-
-  server.close(() => {
-    console.log("✅ Server closed gracefully");
-    process.exit(0);
-  });
-});
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
 
 // Handle uncaught exceptions
 process.on("uncaughtException", (error) => {
@@ -546,31 +544,53 @@ process.on("uncaughtException", (error) => {
 
 process.on("unhandledRejection", (reason, promise) => {
   console.error("❌ Unhandled Rejection at:", promise, "reason:", reason);
+  process.exit(1);
 });
 
+// Start server with proper initialization
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
-  console.log(`🏥 Health Check: http://localhost:${PORT}/api/health`);
-  console.log("");
-  console.log("🔐 Authentication Endpoints:");
-  console.log(`   POST http://localhost:${PORT}/api/auth/register`);
-  console.log(`   POST http://localhost:${PORT}/api/auth/login`);
-  console.log(`   GET  http://localhost:${PORT}/api/auth/verify`);
-  console.log(`   POST http://localhost:${PORT}/api/auth/logout`);
-  console.log("");
-  console.log("🔧 Protected Sensor Endpoints (requires Bearer token):");
-  console.log(`   GET http://localhost:${PORT}/api/sensor/current`);
-  console.log(`   GET http://localhost:${PORT}/api/sensor/aggregate/today`);
-  console.log(`   GET http://localhost:${PORT}/api/sensor/realtime/stats`);
-  console.log(`   GET http://localhost:${PORT}/api/sensor/history/YYYY-MM-DD`);
-  console.log("");
-  console.log("🔧 Protected System Endpoints (requires Bearer token):");
-  console.log(`   GET http://localhost:${PORT}/api/system/status`);
-  console.log(`   GET http://localhost:${PORT}/api/stats`);
-  console.log(`   GET http://localhost:${PORT}/api/logs`);
-  console.log("");
-  console.log("🔧 Protected Debug Endpoints (requires Bearer token):");
-  console.log(`   POST http://localhost:${PORT}/api/debug/process-buffer`);
-  console.log(`   POST http://localhost:${PORT}/api/debug/process-aggregate`);
-});
+
+async function startServer() {
+  try {
+    // Initialize services first
+    await initializeServices();
+
+    // Then start HTTP server
+    server.listen(PORT, () => {
+      console.log(`🚀 Server running on http://localhost:${PORT}`);
+      console.log(`🏥 Health Check: http://localhost:${PORT}/api/health`);
+      console.log("");
+      console.log("🔐 Services Status:");
+      console.log(`   ✅ Temperature Service: Initialized`);
+      console.log(
+        `   ✅ MQTT Service: ${
+          mqttService.getStatus().connected ? "Connected" : "Connecting..."
+        }`
+      );
+      console.log(
+        `   ✅ Database: ${
+          process.env.DATABASE_URL ? "Configured" : "NOT CONFIGURED!"
+        }`
+      );
+      console.log(
+        `   ✅ JWT: ${
+          process.env.JWT_SECRET ? "Configured" : "NOT CONFIGURED!"
+        }`
+      );
+      console.log("");
+      console.log("📡 MQTT Configuration:");
+      console.log(`   Broker: ${mqttService.config.brokerUrl}`);
+      console.log(`   Topic: ${mqttService.config.topic}`);
+      console.log("");
+      console.log("🔧 New Endpoints:");
+      console.log(`   GET  /api/mqtt/status (MQTT detail status)`);
+      console.log(`   POST /api/debug/mqtt-reconnect (Force MQTT reconnect)`);
+    });
+  } catch (error) {
+    console.error("❌ Failed to start server:", error);
+    process.exit(1);
+  }
+}
+
+// Start the server
+startServer();
