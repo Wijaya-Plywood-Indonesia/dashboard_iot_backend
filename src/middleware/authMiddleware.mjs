@@ -1,3 +1,4 @@
+// filepath: backend/src/middleware/authMiddleware.mjs
 import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { PrismaClient } from "@prisma/client";
@@ -5,20 +6,30 @@ import {
   isDefaultAdmin,
   validateDefaultAdminPassword,
   getDefaultAdminCredentials,
-  logger,
 } from "../lib/utils.mjs";
 
 const prisma = new PrismaClient();
 
-// Hybrid user authentication (Default Admin + Database Users)
+// PERBAIKAN: Simplified logging function (no circular references)
+const logAuth = (level, message, data = {}) => {
+  const timestamp = new Date().toISOString();
+  const sanitizedData = {
+    username: data.username || "unknown",
+    userId: data.userId || null,
+    ip: data.ip || "unknown",
+  };
+  console.log(`${level} [${timestamp}] ${message}`, sanitizedData);
+};
+
+// PERBAIKAN: Hybrid user authentication (Fixed circular reference)
 export const authenticateUser = async (username, password) => {
   try {
-    // PERBAIKAN: Check if it's default admin first
+    // Check if it's default admin first
     if (isDefaultAdmin(username)) {
       const isValidPassword = await validateDefaultAdminPassword(password);
       if (isValidPassword) {
         const defaultAdmin = getDefaultAdminCredentials();
-        logger.success("Default admin login successful", { username });
+        logAuth("✅", "Default admin login successful", { username });
         return {
           success: true,
           user: {
@@ -30,7 +41,7 @@ export const authenticateUser = async (username, password) => {
           },
         };
       } else {
-        logger.warn("Default admin login failed - invalid password", {
+        logAuth("⚠️", "Default admin login failed - invalid password", {
           username,
         });
         return {
@@ -40,7 +51,7 @@ export const authenticateUser = async (username, password) => {
       }
     }
 
-    // PERBAIKAN: Check database users
+    // PERBAIKAN: Check database users with better error handling
     try {
       const user = await prisma.user.findUnique({
         where: { username },
@@ -55,7 +66,7 @@ export const authenticateUser = async (username, password) => {
       });
 
       if (!user) {
-        logger.warn("Database user login failed - user not found", {
+        logAuth("⚠️", "Database user login failed - user not found", {
           username,
         });
         return {
@@ -65,7 +76,9 @@ export const authenticateUser = async (username, password) => {
       }
 
       if (!user.isActive) {
-        logger.warn("Database user login failed - user inactive", { username });
+        logAuth("⚠️", "Database user login failed - user inactive", {
+          username,
+        });
         return {
           success: false,
           error: "Account is inactive",
@@ -76,7 +89,7 @@ export const authenticateUser = async (username, password) => {
       const isValidPassword = await comparePassword(password, user.password);
 
       if (!isValidPassword) {
-        logger.warn("Database user login failed - invalid password", {
+        logAuth("⚠️", "Database user login failed - invalid password", {
           username,
         });
         return {
@@ -91,7 +104,7 @@ export const authenticateUser = async (username, password) => {
         data: { lastLoginAt: new Date() },
       });
 
-      logger.success("Database user login successful", {
+      logAuth("✅", "Database user login successful", {
         username,
         userId: user.id,
       });
@@ -107,7 +120,8 @@ export const authenticateUser = async (username, password) => {
         },
       };
     } catch (dbError) {
-      logger.error("Database error during authentication", {
+      // PERBAIKAN: Simplified error logging (no circular reference)
+      logAuth("❌", "Database error during authentication", {
         username,
         error: dbError.message,
       });
@@ -117,7 +131,7 @@ export const authenticateUser = async (username, password) => {
       };
     }
   } catch (error) {
-    logger.error("Authentication error", { username, error: error.message });
+    logAuth("❌", "Authentication error", { username, error: error.message });
     return {
       success: false,
       error: "Authentication failed",
@@ -125,7 +139,7 @@ export const authenticateUser = async (username, password) => {
   }
 };
 
-// Simplified JWT verification with hybrid support
+// PERBAIKAN: Simplified JWT verification
 export const verifyToken = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -143,7 +157,7 @@ export const verifyToken = async (req, res, next) => {
     try {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-      // PERBAIKAN: Handle default admin vs database user
+      // Handle default admin vs database user
       if (decoded.userId === 0) {
         // Default admin
         const defaultAdmin = getDefaultAdminCredentials();
@@ -180,12 +194,11 @@ export const verifyToken = async (req, res, next) => {
             isDefaultAdmin: false,
           };
         } catch (dbError) {
-          logger.warn("Database error during token verification", {
+          logAuth("⚠️", "Database error during token verification", {
             userId: decoded.userId,
             error: dbError.message,
           });
 
-          // If database is down, we can't verify database users
           return res.status(503).json({
             error: "Authentication service unavailable",
             message: "Unable to verify user credentials",
@@ -212,7 +225,7 @@ export const verifyToken = async (req, res, next) => {
       throw jwtError;
     }
   } catch (error) {
-    logger.error("Auth middleware error", { error: error.message });
+    logAuth("❌", "Auth middleware error", { error: error.message });
     res.status(500).json({
       error: "Authentication failed",
       message: "Internal server error during authentication",
@@ -237,10 +250,9 @@ export const createRateLimit = (
     standardHeaders: true,
     legacyHeaders: false,
     handler: (req, res) => {
-      logger.warn("Rate limit exceeded", {
+      logAuth("⚠️", "Rate limit exceeded", {
         ip: req.ip,
         path: req.path,
-        userAgent: req.get("User-Agent"),
       });
       res.status(429).json({
         error: "Rate limit exceeded",
@@ -252,7 +264,7 @@ export const createRateLimit = (
   });
 };
 
-// Generate JWT token with hybrid support
+// Generate JWT token
 export const generateToken = (userId, expiresIn = "7d") => {
   return jwt.sign(
     {
@@ -264,78 +276,4 @@ export const generateToken = (userId, expiresIn = "7d") => {
     process.env.JWT_SECRET,
     { expiresIn }
   );
-};
-
-// Validate token without middleware
-export const validateToken = (token) => {
-  try {
-    return jwt.verify(token, process.env.JWT_SECRET);
-  } catch (error) {
-    return null;
-  }
-};
-
-// Optional authentication (untuk endpoints yang bisa public/protected)
-export const optionalAuth = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    req.user = null;
-    return next();
-  }
-
-  try {
-    const token = authHeader.substring(7);
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    if (decoded.userId === 0) {
-      // Default admin
-      const defaultAdmin = getDefaultAdminCredentials();
-      req.user = {
-        id: 0,
-        username: defaultAdmin.username,
-        email: defaultAdmin.email,
-        role: defaultAdmin.role,
-        isDefaultAdmin: true,
-      };
-    } else {
-      // Database user
-      const user = await prisma.user.findUnique({
-        where: { id: decoded.userId },
-        select: {
-          id: true,
-          username: true,
-          email: true,
-          role: true,
-          isActive: true,
-        },
-      });
-
-      req.user =
-        user && user.isActive ? { ...user, isDefaultAdmin: false } : null;
-    }
-  } catch (error) {
-    req.user = null;
-  }
-
-  next();
-};
-
-// Basic API key middleware
-export const verifyApiKey = (req, res, next) => {
-  const apiKey = req.headers["x-api-key"];
-  const validApiKey = process.env.INTERNAL_API_KEY;
-
-  if (!validApiKey) {
-    return next(); // Skip if not configured
-  }
-
-  if (!apiKey || apiKey !== validApiKey) {
-    return res.status(401).json({
-      error: "Invalid API key",
-      message: "Valid API key required in X-API-Key header",
-    });
-  }
-
-  next();
 };

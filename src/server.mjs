@@ -6,7 +6,7 @@ import path from "path";
 import helmet from "helmet";
 import { Server } from "socket.io";
 import { TemperatureService } from "./services/dataService.mjs";
-import { MQTTService } from "./services/mqttService.mjs"; // PERBAIKAN: Import MQTTService
+import { MQTTService } from "./services/mqttService.mjs";
 import sensorRoutes from "./routes/sensor.mjs";
 import authRoutes from "./routes/auth.mjs";
 import { verifyToken, createRateLimit } from "./middleware/authMiddleware.mjs";
@@ -51,7 +51,7 @@ const io = new Server(server, {
   },
 });
 
-// PERBAIKAN: Validasi environment variables
+// Validasi environment variables
 const requiredEnvVars = ["JWT_SECRET"];
 requiredEnvVars.forEach((varName) => {
   if (!process.env[varName]) {
@@ -60,7 +60,7 @@ requiredEnvVars.forEach((varName) => {
   }
 });
 
-// PERBAIKAN: Service instances - gunakan class-based services
+// Service instances
 let temperatureService;
 let mqttService;
 
@@ -85,11 +85,17 @@ async function initializeServices() {
   }
 }
 
+// PERBAIKAN: Middleware untuk inject services ke semua routes
+app.use((req, res, next) => {
+  req.services = { temperatureService, mqttService };
+  next();
+});
+
 // Routes
 app.use("/api/auth", authRoutes);
-app.use("/api/sensor", verifyToken, sensorRoutes);
+app.use("/api/sensor", sensorRoutes); // PERBAIKAN: Hapus verifyToken di sini, sudah ada di routes
 
-// PERBAIKAN: Socket.IO connection handling dengan service integration
+// PERBAIKAN: Socket.IO connection handling
 io.on("connection", (socket) => {
   console.log(`👤 Client connected: ${socket.id}`);
 
@@ -145,7 +151,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // PERBAIKAN: MQTT control via Socket.IO
+  // MQTT control via Socket.IO
   socket.on("mqttReconnect", () => {
     try {
       if (mqttService) {
@@ -159,10 +165,10 @@ io.on("connection", (socket) => {
 });
 
 // ===========================================
-// API ENDPOINTS
+// API ENDPOINTS - PERBAIKAN: HAPUS YANG KONFLIK
 // ===========================================
 
-// PERBAIKAN: Status endpoint menggunakan services
+// Status endpoint menggunakan services
 app.get("/api/status", verifyToken, async (req, res) => {
   try {
     const tempStatus = temperatureService
@@ -183,278 +189,9 @@ app.get("/api/status", verifyToken, async (req, res) => {
   }
 });
 
-// GET - Current temperature (PROTECTED)
-app.get("/api/suhu", verifyToken, (req, res) => {
-  console.log(`📊 Temperature data requested by user: ${req.user.username}`);
+// PERBAIKAN: HAPUS endpoint /api/suhu dari sini karena sudah ada di sensor.mjs sebagai /api/sensor/suhu
 
-  const lastTemp = mqttService ? mqttService.getLastTemperature() : 0;
-  const mqttStatus = mqttService
-    ? mqttService.getStatus()
-    : { connected: false };
-
-  res.json({
-    suhu: lastTemp,
-    timestamp: new Date().toISOString(),
-    status: mqttStatus.connected ? "connected" : "disconnected",
-    mqttInfo: {
-      brokerUrl: mqttStatus.brokerUrl,
-      topic: mqttStatus.topic,
-      reconnectAttempts: mqttStatus.reconnectAttempts,
-    },
-    requestedBy: req.user.username,
-  });
-});
-
-// GET - Today's aggregate data (PROTECTED)
-app.get("/api/aggregate/today", verifyToken, async (req, res) => {
-  try {
-    console.log(`📈 Aggregate data requested by user: ${req.user.username}`);
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-
-    const { PrismaClient } = await import("@prisma/client");
-    const prisma = new PrismaClient();
-
-    const aggregateData = await prisma.temperatureAggregate.findMany({
-      where: {
-        date: {
-          gte: today,
-          lt: tomorrow,
-        },
-      },
-      orderBy: { timeSlot: "asc" },
-    });
-
-    await prisma.$disconnect();
-
-    if (aggregateData.length === 0) {
-      return res.json({
-        success: true,
-        message: "No aggregate data available for today",
-        data: { aggregates: [] },
-        requestedBy: req.user.username,
-      });
-    }
-
-    const dailyStats = {
-      totalSlots: aggregateData.length,
-      avgTemp:
-        aggregateData.reduce((sum, item) => sum + item.meanTemp, 0) /
-        aggregateData.length,
-      maxTemp: Math.max(...aggregateData.map((item) => item.maxTemp)),
-      minTemp: Math.min(...aggregateData.map((item) => item.minTemp)),
-      totalSamples: aggregateData.reduce(
-        (sum, item) => sum + item.sampleCount,
-        0
-      ),
-    };
-
-    res.json({
-      success: true,
-      message: "Today's aggregate data retrieved successfully",
-      data: {
-        aggregates: aggregateData,
-        dailyStats: {
-          ...dailyStats,
-          avgTemp: Math.round(dailyStats.avgTemp * 100) / 100,
-        },
-      },
-      requestedBy: req.user.username,
-    });
-  } catch (error) {
-    console.error("Error getting today aggregate:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to get today's aggregate data",
-      error: error.message,
-    });
-  }
-});
-
-// GET - System status (PROTECTED)
-app.get("/api/system/status", verifyToken, async (req, res) => {
-  try {
-    console.log(`🔧 System status requested by user: ${req.user.username}`);
-
-    const tempStatus = temperatureService
-      ? await temperatureService.getSystemStatus()
-      : null;
-    const mqttStatus = mqttService ? mqttService.getStatus() : null;
-
-    res.json({
-      success: true,
-      data: {
-        temperature: tempStatus,
-        mqtt: mqttStatus,
-        serverUptime: process.uptime(),
-        timestamp: new Date().toISOString(),
-      },
-      requestedBy: req.user.username,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: "Failed to get system status",
-      message: error.message,
-    });
-  }
-});
-
-// POST - Force process buffer (PROTECTED)
-app.post("/api/debug/process-buffer", verifyToken, async (req, res) => {
-  try {
-    console.log(`🔧 Buffer processing forced by user: ${req.user.username}`);
-
-    if (!temperatureService) {
-      return res.status(503).json({
-        success: false,
-        error: "Temperature service not initialized",
-      });
-    }
-
-    const result = await temperatureService.forceProcessBuffer();
-    res.json({
-      success: true,
-      message: "Buffer processed manually",
-      data: result,
-      processedBy: req.user.username,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: "Failed to process buffer",
-      message: error.message,
-    });
-  }
-});
-
-// POST - Force process aggregate (PROTECTED)
-app.post("/api/debug/process-aggregate", verifyToken, async (req, res) => {
-  try {
-    console.log(`🔧 Aggregate processing forced by user: ${req.user.username}`);
-
-    if (!temperatureService) {
-      return res.status(503).json({
-        success: false,
-        error: "Temperature service not initialized",
-      });
-    }
-
-    const result = await temperatureService.forceProcessAggregation();
-    res.json({
-      success: true,
-      message: "Aggregation processed manually",
-      data: result,
-      processedBy: req.user.username,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: "Failed to process aggregation",
-      message: error.message,
-    });
-  }
-});
-
-// POST - Force MQTT reconnect (PROTECTED)
-app.post("/api/debug/mqtt-reconnect", verifyToken, async (req, res) => {
-  try {
-    console.log(`🔧 MQTT reconnect forced by user: ${req.user.username}`);
-
-    if (!mqttService) {
-      return res.status(503).json({
-        success: false,
-        error: "MQTT service not initialized",
-      });
-    }
-
-    mqttService.forceReconnect();
-
-    res.json({
-      success: true,
-      message: "MQTT reconnection initiated",
-      processedBy: req.user.username,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: "Failed to reconnect MQTT",
-      message: error.message,
-    });
-  }
-});
-
-// GET - MQTT status detail (PROTECTED)
-app.get("/api/mqtt/status", verifyToken, async (req, res) => {
-  try {
-    console.log(`📡 MQTT status requested by user: ${req.user.username}`);
-
-    if (!mqttService) {
-      return res.status(503).json({
-        error: "MQTT service not initialized",
-      });
-    }
-
-    const status = mqttService.getStatus();
-
-    res.json({
-      success: true,
-      data: status,
-      requestedBy: req.user.username,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: "Failed to get MQTT status",
-      message: error.message,
-    });
-  }
-});
-
-// GET - System statistics (PROTECTED)
-app.get("/api/stats", verifyToken, async (req, res) => {
-  try {
-    console.log(`📊 System stats requested by user: ${req.user.username}`);
-
-    const { PrismaClient } = await import("@prisma/client");
-    const prisma = new PrismaClient();
-
-    const stats = await prisma.$transaction([
-      prisma.temperatureBuffer.count(),
-      prisma.temperatureBuffer.count({ where: { isProcessed: false } }),
-      prisma.temperatureAggregate.count({ where: { isExported: false } }),
-      prisma.dailyTemperatureBackup.count(),
-      prisma.systemLog.count({ where: { level: "ERROR" } }),
-    ]);
-
-    await prisma.$disconnect();
-
-    const tempStatus = temperatureService
-      ? await temperatureService.getSystemStatus()
-      : null;
-    const mqttStatus = mqttService ? mqttService.getStatus() : null;
-
-    res.json({
-      totalBufferCount: stats[0],
-      activeBufferCount: stats[1],
-      aggregateCount: stats[2],
-      backupCount: stats[3],
-      errorCount: stats[4],
-      temperatureService: tempStatus,
-      mqttService: mqttStatus,
-      serverUptime: Math.round(process.uptime()),
-      lastUpdate: new Date().toISOString(),
-      requestedBy: req.user.username,
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to get statistics" });
-  }
-});
-
-// GET - Health check (PUBLIC)
+// Health check (PUBLIC)
 app.get("/api/health", (req, res) => {
   const mqttStatus = mqttService ? mqttService.getStatus() : null;
   const lastTemp = mqttService ? mqttService.getLastTemperature() : 0;
@@ -500,17 +237,15 @@ app.use((req, res) => {
     availableEndpoints: [
       "GET /api/health (public)",
       "GET /api/status (requires token)",
-      "GET /api/suhu (requires token)",
-      "GET /api/mqtt/status (requires token)",
-      "POST /api/debug/mqtt-reconnect (requires token)",
-      "GET /api/system/status (requires token)",
-      "GET /api/stats (requires token)",
+      "GET /api/sensor/suhu (requires token) - FOR DRYERS.JSX",
+      "GET /api/sensor/current (requires token)",
+      "GET /api/sensor/history/:date (requires token)",
     ],
     timestamp: new Date().toISOString(),
   });
 });
 
-// PERBAIKAN: Graceful shutdown dengan proper service cleanup
+// Graceful shutdown dengan proper service cleanup
 async function gracefulShutdown() {
   console.log("🔄 Shutting down gracefully...");
 
@@ -547,7 +282,7 @@ process.on("unhandledRejection", (reason, promise) => {
   process.exit(1);
 });
 
-// Start server with proper initialization
+// Start server dengan proper initialization
 const PORT = process.env.PORT || 5000;
 
 async function startServer() {
@@ -582,9 +317,9 @@ async function startServer() {
       console.log(`   Broker: ${mqttService.config.brokerUrl}`);
       console.log(`   Topic: ${mqttService.config.topic}`);
       console.log("");
-      console.log("🔧 New Endpoints:");
-      console.log(`   GET  /api/mqtt/status (MQTT detail status)`);
-      console.log(`   POST /api/debug/mqtt-reconnect (Force MQTT reconnect)`);
+      console.log("🔧 Fixed Endpoints:");
+      console.log(`   GET  /api/sensor/suhu (Fixed for Dryers.jsx)`);
+      console.log(`   GET  /api/sensor/current (Fixed routing)`);
     });
   } catch (error) {
     console.error("❌ Failed to start server:", error);

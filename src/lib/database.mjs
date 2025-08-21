@@ -1,172 +1,116 @@
 import { PrismaClient } from "@prisma/client";
 
-class DatabaseClient {
-  constructor() {
-    if (DatabaseClient.instance) {
-      return DatabaseClient.instance;
-    }
+// PERBAIKAN: Singleton yang lebih sederhana tanpa proxy kompleks
+let prismaInstance = null;
+let isConnected = false;
 
-    this.prisma = new PrismaClient({
-      log: process.env.NODE_ENV === "development" ? ["error"] : ["error"],
-      errorFormat: "minimal",
-    });
-
-    this.isConnected = false;
-    this.connectionPromise = null;
-    this.maxRetries = 3;
-
-    DatabaseClient.instance = this;
+const createPrismaClient = () => {
+  if (prismaInstance) {
+    return prismaInstance;
   }
 
-  async initialize() {
-    try {
-      await this.connect();
-      this.setupEventHandlers();
-    } catch (error) {
-      console.error("🚨 Failed to initialize database:", error);
-      throw error;
-    }
-  }
+  prismaInstance = new PrismaClient({
+    log: ["error"],
+    errorFormat: "minimal",
+  });
 
-  async ensureConnected() {
-    if (this.isConnected) {
-      return this.prisma;
-    }
+  console.log("✅ Prisma Client created");
+  return prismaInstance;
+};
 
-    if (this.connectionPromise) {
-      await this.connectionPromise;
-      return this.prisma;
-    }
+// PERBAIKAN: Database wrapper yang sederhana
+export const db = {
+  async withRetry(operation, maxRetries = 3) {
+    const client = createPrismaClient();
 
-    this.connectionPromise = this.connect();
-    await this.connectionPromise;
-    return this.prisma;
-  }
-
-  async connect() {
-    try {
-      await this.prisma.$connect();
-      this.isConnected = true;
-      this.connectionRetries = 0;
-      console.log("✅ Database connected successfully");
-
-      // Test connection
-      await this.healthCheck();
-    } catch (error) {
-      this.isConnected = false;
-      console.error("❌ Database connection failed:", error);
-
-      if (this.connectionRetries < this.maxRetries) {
-        this.connectionRetries++;
-        console.log(
-          `🔄 Retrying connection (${this.connectionRetries}/${this.maxRetries}) in 5 seconds...`
-        );
-        setTimeout(() => this.connect(), 5000);
-      } else {
-        throw new Error(
-          `Database connection failed after ${this.maxRetries} attempts`
-        );
-      }
-    }
-  }
-
-  setupGracefulShutdown() {
-    const shutdown = async () => {
-      console.log("🔌 Disconnecting database...");
-      await this.prisma.$disconnect();
-      this.isConnected = false;
-      console.log("✅ Database disconnected");
-    };
-
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
-    process.on("beforeExit", shutdown);
-  }
-
-  async healthCheck() {
-    try {
-      await this.prisma.$queryRaw`SELECT 1`;
-      return { status: "healthy", timestamp: new Date() };
-    } catch (error) {
-      console.error("❌ Database health check failed:", error);
-      this.isConnected = false;
-      throw error;
-    }
-  }
-
-  setupEventHandlers() {
-    // Handle Prisma client errors
-    this.prisma.$on("error", (error) => {
-      console.error("🚨 Prisma Client Error:", error);
-      this.isConnected = false;
-    });
-
-    // Handle process exit
-    process.on("beforeExit", async () => {
-      await this.disconnect();
-    });
-
-    process.on("SIGINT", async () => {
-      await this.disconnect();
-      process.exit(0);
-    });
-  }
-
-  async disconnect() {
-    try {
-      await this.prisma.$disconnect();
-      this.isConnected = false;
-      console.log("✅ Database disconnected gracefully");
-    } catch (error) {
-      console.error("❌ Error disconnecting database:", error);
-    }
-  }
-
-  async getClient() {
-    return await this.ensureConnected();
-  }
-
-  async withRetry(operation, retries = 3) {
-    const client = await this.ensureConnected();
-
-    for (let attempt = 1; attempt <= retries; attempt++) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        return await operation(client);
+        console.log(`📊 Database operation attempt ${attempt}/${maxRetries}`);
+
+        // PERBAIKAN: Pastikan client tersedia
+        if (!client) {
+          throw new Error("Prisma client not available");
+        }
+
+        const result = await operation(client);
+
+        if (attempt > 1) {
+          console.log(`✅ Database operation succeeded on attempt ${attempt}`);
+        }
+
+        return result;
       } catch (error) {
         console.warn(
-          `⚠️ Database operation failed (attempt ${attempt}/${retries}):`,
+          `⚠️ Database operation failed (attempt ${attempt}/${maxRetries}):`,
           error.message
         );
 
-        if (attempt === retries) {
+        if (attempt === maxRetries) {
+          console.error(
+            `❌ Database operation failed after ${maxRetries} attempts`
+          );
           throw error;
         }
 
-        // Simple backoff: wait 1s, 2s, 3s
-        await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+        // Wait before retry
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
       }
     }
-  }
-}
-const dbClient = new DatabaseClient();
+  },
 
-export const db = dbClient;
+  // PERBAIKAN: Direct client access
+  getClient() {
+    return createPrismaClient();
+  },
 
-// PERBAIKAN: Export prisma client yang selalu connected
-export const prisma = new Proxy(
-  {},
-  {
-    get(target, prop) {
-      return async (...args) => {
-        const client = await dbClient.getClient();
-        const method = client[prop];
-        if (typeof method === "function") {
-          return method.apply(client, args);
-        }
-        return method;
-      };
-    },
-  }
-);
+  // Connection test
+  async testConnection() {
+    try {
+      const client = createPrismaClient();
+      await client.$connect();
+      await client.$queryRaw`SELECT 1 as test`;
+      isConnected = true;
+      console.log("✅ Database connection test successful");
+      return true;
+    } catch (error) {
+      console.error("❌ Database connection test failed:", error.message);
+      isConnected = false;
+      return false;
+    }
+  },
 
-export default dbClient;
+  // Graceful disconnect
+  async disconnect() {
+    try {
+      if (prismaInstance) {
+        await prismaInstance.$disconnect();
+        console.log("✅ Database disconnected gracefully");
+      }
+      prismaInstance = null;
+      isConnected = false;
+    } catch (error) {
+      console.error("❌ Error disconnecting from database:", error.message);
+    }
+  },
+};
+
+// PERBAIKAN: Simple prisma export without proxy
+export const prisma = createPrismaClient();
+
+// Test connection on startup
+db.testConnection();
+
+// Graceful shutdown
+process.on("beforeExit", async () => {
+  await db.disconnect();
+});
+
+process.on("SIGINT", async () => {
+  await db.disconnect();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  await db.disconnect();
+  process.exit(0);
+});
