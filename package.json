@@ -4,8 +4,8 @@
   "description": "Sistem monitoring suhu dengan ESP32, MQTT, dan database buffer",
   "main": "src/server/server.mjs",
   "scripts": {
-    "start": "node src/server/server.mjs",
-    "dev": "nodemon src/server/server.mjs",
+    "start": "node src/server.mjs",
+    "dev": "nodemon src/server.mjs",
     "db:generate": "npx prisma generate",
     "db:push": "npx prisma db push",
     "db:migrate": "npx prisma migrate dev",

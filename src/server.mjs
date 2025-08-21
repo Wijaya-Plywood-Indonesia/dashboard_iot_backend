@@ -5,11 +5,11 @@ import cors from "cors";
 import path from "path";
 import helmet from "helmet";
 import { Server } from "socket.io";
-import { TemperatureService } from "../services/dataService.mjs";
-import { MQTTService } from "../services/mqttService.mjs"; // PERBAIKAN: Import MQTTService
-import sensorRoutes from "../routes/sensor.mjs";
-import authRoutes from "../routes/auth.mjs";
-import { verifyToken, createRateLimit } from "../middleware/authMiddleware.mjs";
+import { TemperatureService } from "./services/dataService.mjs";
+import { MQTTService } from "./services/mqttService.mjs"; // PERBAIKAN: Import MQTTService
+import sensorRoutes from "./routes/sensor.mjs";
+import authRoutes from "./routes/auth.mjs";
+import { verifyToken, createRateLimit } from "./middleware/authMiddleware.mjs";
 
 const app = express();
 

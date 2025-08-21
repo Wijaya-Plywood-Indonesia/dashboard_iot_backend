@@ -1,10 +1,10 @@
 import fs from "fs/promises";
 import path from "path";
+import ExcelJS from "exceljs";
 import { db } from "../lib/database.mjs";
 
 export class TemperatureService {
   constructor() {
-    // PERBAIKAN: Simplified configuration
     this.config = {
       maxBufferSize: parseInt(process.env.MAX_BUFFER_SIZE) || 1000,
       bufferThreshold: parseInt(process.env.BUFFER_CLEANUP_THRESHOLD) || 800,
@@ -12,7 +12,6 @@ export class TemperatureService {
       bufferIntervalMinutes: 1,
     };
 
-    // PERBAIKAN: Simple state tracking
     this.state = {
       bufferData: [],
       lastSavedMinute: null,
@@ -30,7 +29,6 @@ export class TemperatureService {
     console.log("✅ TemperatureService initialized");
   }
 
-  // PERBAIKAN: Clear scheduler initialization
   startSchedulers() {
     console.log("🔄 Starting schedulers...");
 
@@ -44,13 +42,10 @@ export class TemperatureService {
       this.processAggregation().catch(this.handleError.bind(this));
     }, this.config.aggregateIntervalMinutes * 60 * 1000);
 
-    // Schedule daily export at midnight
     this.scheduleDailyExport();
-
     console.log("✅ All schedulers started");
   }
 
-  // PERBAIKAN: Simplified data reception
   async receiveTemperatureData(temperature) {
     try {
       const temp = parseFloat(temperature);
@@ -65,7 +60,6 @@ export class TemperatureService {
         minute: this.formatMinute(now),
       };
 
-      // PERBAIKAN: Buffer management with emergency cleanup
       if (this.state.bufferData.length >= this.config.maxBufferSize) {
         console.warn("⚠️ Buffer full, performing emergency cleanup...");
         await this.emergencyCleanup();
@@ -73,7 +67,6 @@ export class TemperatureService {
 
       this.state.bufferData.push(dataPoint);
 
-      // PERBAIKAN: Auto-process if threshold reached
       if (this.state.bufferData.length >= this.config.bufferThreshold) {
         await this.processBuffer();
       }
@@ -97,7 +90,6 @@ export class TemperatureService {
     }
   }
 
-  // PERBAIKAN: Simplified buffer processing
   async processBuffer() {
     if (this.state.isProcessing || this.state.bufferData.length === 0) {
       return;
@@ -108,7 +100,6 @@ export class TemperatureService {
     try {
       const currentMinute = this.formatMinute(new Date());
 
-      // Skip if already processed this minute
       if (this.state.lastSavedMinute === currentMinute) {
         this.logInfo(
           `⏭️ Minute ${currentMinute} already processed, skipping...`
@@ -116,7 +107,6 @@ export class TemperatureService {
         return;
       }
 
-      // PERBAIKAN: Calculate average from buffer
       const temperatures = this.state.bufferData.map(
         (item) => item.temperature
       );
@@ -124,7 +114,6 @@ export class TemperatureService {
         temperatures.reduce((sum, temp) => sum + temp, 0) / temperatures.length;
       const roundedAvg = Math.round(avgTemp * 100) / 100;
 
-      // PERBAIKAN: Save to database with retry
       const savedData = await db.withRetry(async (prisma) => {
         return await prisma.temperatureBuffer.create({
           data: {
@@ -135,10 +124,9 @@ export class TemperatureService {
         });
       });
 
-      // PERBAIKAN: Update state after successful save
       this.state.lastSavedMinute = currentMinute;
       const bufferCount = this.state.bufferData.length;
-      this.state.bufferData = []; // Clear buffer
+      this.state.bufferData = [];
 
       this.logInfo(
         `✅ Buffer processed: ${roundedAvg}°C from ${bufferCount} samples saved (ID: ${savedData.id})`
@@ -158,19 +146,16 @@ export class TemperatureService {
     }
   }
 
-  // PERBAIKAN: Simplified aggregation processing
   async processAggregation() {
     try {
       const now = new Date();
       const timeSlot = this.generateTimeSlot(now);
 
-      // Skip if already processed
       if (this.state.lastProcessedSlot === timeSlot) {
         this.logInfo(`⏭️ Slot ${timeSlot} already processed, skipping...`);
         return;
       }
 
-      // PERBAIKAN: Get data for aggregation
       const { startTime, endTime } = this.getSlotTimeRange(now);
 
       const bufferData = await db.withRetry(async (prisma) => {
@@ -191,14 +176,11 @@ export class TemperatureService {
         return;
       }
 
-      // PERBAIKAN: Calculate statistics
       const temperatures = bufferData.map((item) => item.temperature);
       const stats = this.calculateStats(temperatures);
 
-      // PERBAIKAN: Save aggregation with transaction
       const result = await db.withRetry(async (prisma) => {
         return await prisma.$transaction(async (tx) => {
-          // Create aggregate
           const aggregate = await tx.temperatureAggregate.create({
             data: {
               date: new Date(now.getFullYear(), now.getMonth(), now.getDate()),
@@ -213,7 +195,6 @@ export class TemperatureService {
             },
           });
 
-          // Mark buffer as processed
           await tx.temperatureBuffer.updateMany({
             where: { id: { in: bufferData.map((item) => item.id) } },
             data: { isProcessed: true },
@@ -246,9 +227,9 @@ export class TemperatureService {
     }
   }
 
-  // PERBAIKAN: Utility methods for better readability
+  // Utility methods
   formatMinute(date) {
-    return date.toISOString().slice(0, 16).replace("T", " "); // YYYY-MM-DD HH:MM
+    return date.toISOString().slice(0, 16).replace("T", " ");
   }
 
   generateTimeSlot(date) {
@@ -294,7 +275,6 @@ export class TemperatureService {
         ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
         : sorted[Math.floor(sorted.length / 2)];
 
-    // Simple mode calculation
     const frequency = {};
     temperatures.forEach((temp) => {
       const rounded = Math.round(temp * 10) / 10;
@@ -315,14 +295,11 @@ export class TemperatureService {
     };
   }
 
-  // PERBAIKAN: Emergency cleanup
   async emergencyCleanup() {
     try {
-      // Keep only last 50 data points
       const keepCount = 50;
       const latestData = this.state.bufferData.slice(-keepCount);
 
-      // Force process current buffer if it has data
       if (this.state.bufferData.length > 0) {
         await this.processBuffer();
       }
@@ -334,12 +311,10 @@ export class TemperatureService {
       );
     } catch (error) {
       this.handleError(error, { context: "emergencyCleanup" });
-      // Last resort: clear buffer completely
       this.state.bufferData = [];
     }
   }
 
-  // PERBAIKAN: Simplified daily export scheduling
   scheduleDailyExport() {
     const now = new Date();
     const tomorrow = new Date(now);
@@ -351,7 +326,6 @@ export class TemperatureService {
     setTimeout(() => {
       this.exportDailyData().catch(this.handleError.bind(this));
 
-      // Set daily interval
       this.timers.export = setInterval(() => {
         this.exportDailyData().catch(this.handleError.bind(this));
       }, 24 * 60 * 60 * 1000);
@@ -364,7 +338,6 @@ export class TemperatureService {
     );
   }
 
-  // PERBAIKAN: Simplified export
   async exportDailyData() {
     try {
       const yesterday = new Date();
@@ -393,11 +366,9 @@ export class TemperatureService {
         return;
       }
 
-      // Create export directory
       const exportDir = path.join(process.cwd(), "exports");
       await fs.mkdir(exportDir, { recursive: true });
 
-      // Export files
       const csvPath = await this.exportToCSV(
         aggregateData,
         dateString,
@@ -409,10 +380,8 @@ export class TemperatureService {
         exportDir
       );
 
-      // Save backup info and mark as exported
       await db.withRetry(async (prisma) => {
         return await prisma.$transaction(async (tx) => {
-          // Create backup record
           await tx.dailyTemperatureBackup.create({
             data: {
               date: dateString,
@@ -425,7 +394,6 @@ export class TemperatureService {
             },
           });
 
-          // Mark as exported
           await tx.temperatureAggregate.updateMany({
             where: { id: { in: aggregateData.map((item) => item.id) } },
             data: { isExported: true },
@@ -434,11 +402,7 @@ export class TemperatureService {
       });
 
       this.logInfo(
-        `✅ Daily export completed: ${aggregateData.length} records for ${dateString}`,
-        {
-          csvPath: path.basename(csvPath),
-          excelPath: path.basename(excelPath),
-        }
+        `✅ Daily export completed: ${aggregateData.length} records for ${dateString}`
       );
 
       return {
@@ -454,90 +418,6 @@ export class TemperatureService {
     }
   }
 
-  // PERBAIKAN: Consistent logging methods
-  logInfo(message, metadata = {}) {
-    console.log(`ℹ️ ${message}`);
-    this.saveLog("INFO", message, metadata).catch(() => {}); // Don't block on log failure
-  }
-
-  logWarn(message, metadata = {}) {
-    console.warn(`⚠️ ${message}`);
-    this.saveLog("WARNING", message, metadata).catch(() => {});
-  }
-
-  logError(message, metadata = {}) {
-    console.error(`❌ ${message}`);
-    this.saveLog("ERROR", message, metadata).catch(() => {});
-  }
-
-  async saveLog(level, message, metadata = {}) {
-    try {
-      await db.withRetry(async (prisma) => {
-        return await prisma.systemLog.create({
-          data: {
-            level,
-            message,
-            metadata: JSON.stringify(metadata),
-            timestamp: new Date(),
-          },
-        });
-      });
-    } catch (error) {
-      // Fallback to console only
-      console.log(`${level}: ${message}`, metadata);
-    }
-  }
-
-  // PERBAIKAN: Centralized error handling
-  handleError(error, context = {}) {
-    const errorMessage = `Error in ${context.context || "unknown"}: ${
-      error.message
-    }`;
-    this.logError(errorMessage, {
-      ...context,
-      stack: error.stack,
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  // PERBAIKAN: System status for debugging
-  async getSystemStatus() {
-    try {
-      const [bufferCount, processedCount, aggregateCount] = await Promise.all([
-        db.withRetry(async (prisma) =>
-          prisma.temperatureBuffer.count({ where: { isProcessed: false } })
-        ),
-        db.withRetry(async (prisma) =>
-          prisma.temperatureBuffer.count({ where: { isProcessed: true } })
-        ),
-        db.withRetry(async (prisma) =>
-          prisma.temperatureAggregate.count({ where: { isExported: false } })
-        ),
-      ]);
-
-      return {
-        status: "healthy",
-        memoryBuffer: this.state.bufferData.length,
-        databaseBuffer: bufferCount,
-        processedBuffer: processedCount,
-        pendingAggregates: aggregateCount,
-        lastSavedMinute: this.state.lastSavedMinute,
-        lastProcessedSlot: this.state.lastProcessedSlot,
-        isProcessing: this.state.isProcessing,
-        config: this.config,
-        timestamp: new Date().toISOString(),
-      };
-    } catch (error) {
-      this.handleError(error, { context: "getSystemStatus" });
-      return {
-        status: "error",
-        error: error.message,
-        timestamp: new Date().toISOString(),
-      };
-    }
-  }
-
-  // PERBAIKAN: Export utilities (keeping existing logic but simplified)
   async exportToCSV(data, dateString, exportDir) {
     const csvPath = path.join(exportDir, `temperature_${dateString}.csv`);
     const csvHeader =
@@ -582,7 +462,6 @@ export class TemperatureService {
       });
     });
 
-    // Style header
     worksheet.getRow(1).font = { bold: true };
     worksheet.getRow(1).fill = {
       type: "pattern",
@@ -612,7 +491,85 @@ export class TemperatureService {
     };
   }
 
-  // PERBAIKAN: Manual testing methods
+  logInfo(message, metadata = {}) {
+    console.log(`ℹ️ ${message}`);
+    this.saveLog("INFO", message, metadata).catch(() => {});
+  }
+
+  logWarn(message, metadata = {}) {
+    console.warn(`⚠️ ${message}`);
+    this.saveLog("WARNING", message, metadata).catch(() => {});
+  }
+
+  logError(message, metadata = {}) {
+    console.error(`❌ ${message}`);
+    this.saveLog("ERROR", message, metadata).catch(() => {});
+  }
+
+  async saveLog(level, message, metadata = {}) {
+    try {
+      await db.withRetry(async (prisma) => {
+        return await prisma.systemLog.create({
+          data: {
+            level,
+            message,
+            metadata: JSON.stringify(metadata),
+            timestamp: new Date(),
+          },
+        });
+      });
+    } catch (error) {
+      console.log(`${level}: ${message}`, metadata);
+    }
+  }
+
+  handleError(error, context = {}) {
+    const errorMessage = `Error in ${context.context || "unknown"}: ${
+      error.message
+    }`;
+    this.logError(errorMessage, {
+      ...context,
+      stack: error.stack,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  async getSystemStatus() {
+    try {
+      const [bufferCount, processedCount, aggregateCount] = await Promise.all([
+        db.withRetry(async (prisma) =>
+          prisma.temperatureBuffer.count({ where: { isProcessed: false } })
+        ),
+        db.withRetry(async (prisma) =>
+          prisma.temperatureBuffer.count({ where: { isProcessed: true } })
+        ),
+        db.withRetry(async (prisma) =>
+          prisma.temperatureAggregate.count({ where: { isExported: false } })
+        ),
+      ]);
+
+      return {
+        status: "healthy",
+        memoryBuffer: this.state.bufferData.length,
+        databaseBuffer: bufferCount,
+        processedBuffer: processedCount,
+        pendingAggregates: aggregateCount,
+        lastSavedMinute: this.state.lastSavedMinute,
+        lastProcessedSlot: this.state.lastProcessedSlot,
+        isProcessing: this.state.isProcessing,
+        config: this.config,
+        timestamp: new Date().toISOString(),
+      };
+    } catch (error) {
+      this.handleError(error, { context: "getSystemStatus" });
+      return {
+        status: "error",
+        error: error.message,
+        timestamp: new Date().toISOString(),
+      };
+    }
+  }
+
   async forceProcessBuffer() {
     this.logInfo("🔧 Manual buffer processing...");
     return await this.processBuffer();
@@ -628,16 +585,13 @@ export class TemperatureService {
     return await this.exportDailyData();
   }
 
-  // PERBAIKAN: Graceful cleanup
   async cleanup() {
     this.logInfo("🔄 Cleaning up TemperatureService...");
 
-    // Clear all timers
     Object.values(this.timers).forEach((timer) => {
       if (timer) clearInterval(timer);
     });
 
-    // Process any remaining buffer data
     if (this.state.bufferData.length > 0) {
       await this.processBuffer();
     }

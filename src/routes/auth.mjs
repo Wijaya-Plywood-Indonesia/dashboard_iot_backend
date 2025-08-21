@@ -1,257 +1,288 @@
-// src/routes/auth.mjs - Enhanced version dengan debug logging
 import express from "express";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import { PrismaClient } from "@prisma/client";
-import { verifyToken } from "../middleware/authMiddleware.mjs";
+import {
+  authenticateUser,
+  generateToken,
+  verifyToken,
+  createRateLimit,
+} from "../middleware/authMiddleware.mjs";
+import {
+  validateUsername,
+  validatePassword,
+  validateEmail,
+  hashPassword,
+  getDefaultAdminCredentials,
+  logger,
+} from "../lib/utils.mjs";
+import {
+  ValidationError,
+  ConflictError,
+  asyncHandler,
+} from "../middleware/errorMiddleware.mjs";
 
-const prisma = new PrismaClient();
 const router = express.Router();
 
-// Gunakan variabel lingkungan untuk secret key JWT
-const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
+// PERBAIKAN: Login endpoint dengan hybrid authentication
+router.post(
+  "/login",
+  createRateLimit(15 * 60 * 1000, 5),
+  asyncHandler(async (req, res) => {
+    const { username, password } = req.body;
 
-/**
- * POST /api/auth/login - Enhanced dengan debug logging
- */
-router.post("/login", async (req, res) => {
-  const { username, password } = req.body;
+    // Validation
+    if (!username || !password) {
+      throw new ValidationError("Username and password are required");
+    }
 
-  console.log(`🔐 Login attempt for username: "${username}"`);
+    if (!validateUsername(username)) {
+      throw new ValidationError("Invalid username format");
+    }
 
-  if (!username || !password) {
-    console.log(
-      `❌ Missing credentials - Username: ${!!username}, Password: ${!!password}`
-    );
-    return res.status(400).json({
-      error: "Username and password are required.",
-    });
-  }
+    if (!validatePassword(password)) {
+      throw new ValidationError("Password must be at least 6 characters");
+    }
 
-  try {
-    // 1. Find the user by their unique username
-    console.log(`🔍 Searching for user: "${username}"`);
-    const user = await prisma.user.findUnique({
-      where: { username: username },
-    });
+    // PERBAIKAN: Authenticate using hybrid system
+    const authResult = await authenticateUser(username, password);
 
-    if (!user) {
-      console.log(`❌ User not found: "${username}"`);
+    if (!authResult.success) {
       return res.status(401).json({
-        error: "Invalid username or password",
+        success: false,
+        error: "Authentication failed",
+        message: authResult.error,
+        timestamp: new Date().toISOString(),
       });
     }
 
-    console.log(`✅ User found: "${username}" (ID: ${user.user_id})`);
-    console.log(`🔍 Password hash length: ${user.password.length}`);
-    console.log(`🔍 Password hash format: ${user.password.substring(0, 7)}...`);
+    // Generate token
+    const token = generateToken(authResult.user.id);
 
-    // 2. Compare the provided password with the stored hashed password
-    console.log(`🧪 Testing password for user: "${username}"`);
+    logger.success("User login successful", {
+      username,
+      userId: authResult.user.id,
+      isDefaultAdmin: authResult.user.isDefaultAdmin,
+    });
+
+    res.json({
+      success: true,
+      message: "Login successful",
+      data: {
+        token,
+        user: {
+          id: authResult.user.id,
+          username: authResult.user.username,
+          email: authResult.user.email,
+          role: authResult.user.role,
+          isDefaultAdmin: authResult.user.isDefaultAdmin,
+        },
+      },
+      timestamp: new Date().toISOString(),
+    });
+  })
+);
+
+// PERBAIKAN: Register endpoint (hanya untuk database users)
+router.post(
+  "/register",
+  createRateLimit(15 * 60 * 1000, 3),
+  asyncHandler(async (req, res) => {
+    const { username, email, password } = req.body;
+
+    // Validation
+    if (!username || !email || !password) {
+      throw new ValidationError("Username, email, and password are required");
+    }
+
+    if (!validateUsername(username)) {
+      throw new ValidationError(
+        "Username must be at least 3 characters and contain only letters, numbers, and underscores"
+      );
+    }
+
+    if (!validateEmail(email)) {
+      throw new ValidationError("Invalid email format");
+    }
+
+    if (!validatePassword(password)) {
+      throw new ValidationError("Password must be at least 6 characters");
+    }
+
+    // PERBAIKAN: Check if username conflicts with default admin
+    const defaultAdmin = getDefaultAdminCredentials();
+    if (username === defaultAdmin.username) {
+      throw new ConflictError("Username is reserved");
+    }
+
+    // Check if user already exists
+    const { PrismaClient } = await import("@prisma/client");
+    const prisma = new PrismaClient();
 
     try {
-      const isPasswordValid = await bcrypt.compare(password, user.password);
-      console.log(`🔍 Password comparison result: ${isPasswordValid}`);
+      const existingUser = await prisma.user.findFirst({
+        where: {
+          OR: [{ username }, { email }],
+        },
+      });
 
-      if (!isPasswordValid) {
-        console.log(`❌ Invalid password for user: "${username}"`);
-
-        // Debug: Test beberapa kemungkinan password
-        console.log(`🔧 Debug: Testing common password variations...`);
-        const testPasswords = [
-          password.toLowerCase(),
-          password.toUpperCase(),
-          password.trim(),
-        ];
-
-        for (const testPwd of testPasswords) {
-          if (testPwd !== password) {
-            const testResult = await bcrypt.compare(testPwd, user.password);
-            console.log(`🔧 Debug: "${testPwd}" -> ${testResult}`);
-            if (testResult) {
-              console.log(`⚠️  Password case sensitivity issue detected!`);
-            }
-          }
+      if (existingUser) {
+        if (existingUser.username === username) {
+          throw new ConflictError("Username already exists");
         }
-
-        return res.status(401).json({
-          error: "Invalid username or password",
-        });
+        if (existingUser.email === email) {
+          throw new ConflictError("Email already exists");
+        }
       }
-    } catch (bcryptError) {
-      console.error(`❌ Bcrypt error:`, bcryptError);
-      return res.status(500).json({
-        error: "Password verification failed",
+
+      // Hash password and create user
+      const hashedPassword = await hashPassword(password);
+
+      const newUser = await prisma.user.create({
+        data: {
+          username,
+          email,
+          password: hashedPassword,
+          role: "user",
+          isActive: true,
+        },
+        select: {
+          id: true,
+          username: true,
+          email: true,
+          role: true,
+          createdAt: true,
+        },
       });
-    }
 
-    // 3. If credentials are correct, create a JWT token
-    console.log(`✅ Password valid for user: "${username}"`);
-
-    const tokenPayload = {
-      userId: user.user_id,
-      username: user.username,
-      iat: Math.floor(Date.now() / 1000),
-    };
-
-    const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: "24h" });
-
-    console.log(`✅ JWT token created for user: "${username}"`);
-    console.log(`🔍 Token payload:`, tokenPayload);
-
-    // 4. Send the token back to the frontend
-    res.json({
-      message: "Login successful",
-      token: token,
-      user: {
-        userId: user.user_id,
-        username: user.username,
-      },
-    });
-  } catch (error) {
-    console.error("❌ Login error:", error);
-    res.status(500).json({
-      error: "An unexpected error occurred during login.",
-    });
-  }
-});
-
-/**
- * POST /api/auth/register
- */
-router.post("/register", async (req, res) => {
-  const { username, password } = req.body;
-
-  console.log(`📝 Registration attempt for username: "${username}"`);
-
-  if (!username || !password) {
-    return res.status(400).json({
-      error: "Username and password are required.",
-    });
-  }
-
-  if (password.length < 6) {
-    return res.status(400).json({
-      error: "Password must be at least 6 characters long.",
-    });
-  }
-
-  try {
-    // Cek apakah username sudah ada
-    const existingUser = await prisma.user.findUnique({
-      where: { username },
-    });
-
-    if (existingUser) {
-      console.log(`❌ Username already exists: "${username}"`);
-      return res.status(400).json({
-        error: "Username already exists. Please choose another username.",
-      });
-    }
-
-    // Hash the password
-    console.log(`🔐 Hashing password for user: "${username}"`);
-    const hashedPassword = await bcrypt.hash(password, 12);
-    console.log(`✅ Password hashed (length: ${hashedPassword.length})`);
-
-    const user = await prisma.user.create({
-      data: {
+      logger.success("User registration successful", {
         username,
-        password: hashedPassword,
-      },
-    });
+        email,
+        userId: newUser.id,
+      });
 
-    console.log(`✅ New user registered: ${username} (ID: ${user.user_id})`);
+      res.status(201).json({
+        success: true,
+        message: "User registered successfully",
+        data: {
+          user: {
+            ...newUser,
+            isDefaultAdmin: false,
+          },
+        },
+        timestamp: new Date().toISOString(),
+      });
+    } finally {
+      await prisma.$disconnect();
+    }
+  })
+);
 
-    res.status(201).json({
-      message: "User registered successfully",
-      userId: user.user_id,
-    });
-  } catch (error) {
-    console.error("❌ Registration error:", error);
-    res.status(500).json({
-      error: "An internal error occurred during registration.",
-    });
-  }
+// PERBAIKAN: Get current user info
+router.get("/me", verifyToken, (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      user: req.user,
+    },
+    timestamp: new Date().toISOString(),
+  });
 });
 
-/**
- * GET /api/auth/verify
- */
-router.get("/verify", verifyToken, async (req, res) => {
-  try {
-    const { userId, username } = req.user;
-    console.log(
-      `🔍 Token verification for user: "${username}" (ID: ${userId})`
-    );
+// PERBAIKAN: Logout endpoint (for logging purposes)
+router.post("/logout", verifyToken, (req, res) => {
+  logger.info("User logout", {
+    username: req.user.username,
+    userId: req.user.id,
+    isDefaultAdmin: req.user.isDefaultAdmin,
+  });
 
-    const user = await prisma.user.findUnique({
-      where: { user_id: userId },
-      select: { user_id: true, username: true },
-    });
+  res.json({
+    success: true,
+    message: "Logout successful",
+    timestamp: new Date().toISOString(),
+  });
+});
 
-    if (!user) {
-      console.log(`❌ User not found during verification: ID ${userId}`);
-      return res.status(401).json({
-        error: "User not found. Token may be invalid.",
+// PERBAIKAN: Get system auth info
+router.get("/info", (req, res) => {
+  const defaultAdmin = getDefaultAdminCredentials();
+
+  res.json({
+    success: true,
+    data: {
+      authSystem: "hybrid",
+      defaultAdminAvailable: true,
+      defaultAdminUsername: defaultAdmin.username,
+      registrationEnabled: true,
+      supportedMethods: ["username_password"],
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// PERBAIKAN: Admin endpoint to list users (protected)
+router.get(
+  "/users",
+  verifyToken,
+  asyncHandler(async (req, res) => {
+    // Check if user is admin
+    if (req.user.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        error: "Access denied",
+        message: "Admin privileges required",
       });
     }
 
-    console.log(`✅ Token verified for user: "${username}"`);
-    res.json({
-      message: "Token is valid",
-      user: {
-        userId: user.user_id,
-        username: user.username,
-      },
-    });
-  } catch (error) {
-    console.error("❌ Token verification error:", error);
-    res.status(500).json({
-      error: "An error occurred during token verification.",
-    });
-  }
-});
+    const { PrismaClient } = await import("@prisma/client");
+    const prisma = new PrismaClient();
 
-/**
- * POST /api/auth/logout
- */
-router.post("/logout", verifyToken, (req, res) => {
-  console.log(`📤 User logged out: ${req.user.username}`);
-  res.json({ message: "Logged out successfully" });
-});
+    try {
+      const users = await prisma.user.findMany({
+        select: {
+          id: true,
+          username: true,
+          email: true,
+          role: true,
+          isActive: true,
+          createdAt: true,
+          lastLoginAt: true,
+        },
+        orderBy: { createdAt: "desc" },
+      });
 
-/**
- * GET /api/auth/profile
- */
-router.get("/profile", verifyToken, async (req, res) => {
-  try {
-    const { userId } = req.user;
+      // Add default admin to the list
+      const defaultAdmin = getDefaultAdminCredentials();
+      const allUsers = [
+        {
+          id: 0,
+          username: defaultAdmin.username,
+          email: defaultAdmin.email,
+          role: defaultAdmin.role,
+          isActive: true,
+          createdAt: null,
+          lastLoginAt: null,
+          isDefaultAdmin: true,
+        },
+        ...users.map((user) => ({ ...user, isDefaultAdmin: false })),
+      ];
 
-    const user = await prisma.user.findUnique({
-      where: { user_id: userId },
-      select: {
-        user_id: true,
-        username: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
+      logger.info("Users list requested", {
+        requestedBy: req.user.username,
+        totalUsers: allUsers.length,
+      });
 
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
+      res.json({
+        success: true,
+        data: {
+          users: allUsers,
+          total: allUsers.length,
+        },
+        requestedBy: req.user.username,
+        timestamp: new Date().toISOString(),
+      });
+    } finally {
+      await prisma.$disconnect();
     }
-
-    res.json({
-      message: "Profile retrieved successfully",
-      profile: user,
-    });
-  } catch (error) {
-    console.error("Profile fetch error:", error);
-    res.status(500).json({
-      error: "An error occurred while fetching profile.",
-    });
-  }
-});
+  })
+);
 
 export default router;

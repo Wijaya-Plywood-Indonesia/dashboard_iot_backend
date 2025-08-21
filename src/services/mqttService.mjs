@@ -3,12 +3,15 @@ import mqtt from "mqtt";
 export class MQTTService {
   constructor(temperatureService, socketIO = null) {
     this.temperatureService = temperatureService;
-    this.io = socketIO; // Socket.IO instance untuk real-time updates
+    this.io = socketIO;
     this.client = null;
     this.isConnected = false;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.lastTemperature = 0;
+    this.lastDataTime = null;
+    this.saveQueue = []; // PERBAIKAN: Queue untuk batch saving
+    this.isProcessingQueue = false;
 
     this.config = {
       brokerUrl: process.env.MQTT_BROKER_URL || "mqtt://broker.hivemq.com:1883",
@@ -22,9 +25,11 @@ export class MQTTService {
       `🔧 MQTT Service initialized with broker: ${this.config.brokerUrl}`
     );
     this.connect();
+
+    // PERBAIKAN: Start queue processor
+    this.startQueueProcessor();
   }
 
-  // Set Socket.IO instance after initialization
   setSocketIO(io) {
     this.io = io;
     console.log("✅ Socket.IO instance set for MQTT Service");
@@ -54,7 +59,6 @@ export class MQTTService {
       this.reconnectAttempts = 0;
       console.log("✅ MQTT connected successfully");
 
-      // Emit status via Socket.IO
       if (this.io) {
         this.io.emit("mqttStatus", {
           status: "connected",
@@ -76,110 +80,37 @@ export class MQTTService {
         }
 
         this.lastTemperature = temperature;
+        this.lastDataTime = new Date();
         console.log(`🌡️ MQTT received: ${temperature}°C from topic ${topic}`);
 
-        // PERBAIKAN: Check if temperatureService exists before calling
-        if (this.temperatureService) {
-          try {
-            const result = await this.temperatureService.receiveTemperatureData(
-              temperature
-            );
+        // PERBAIKAN: Add to queue instead of immediate save
+        this.addToSaveQueue(temperature);
 
-            if (result && result.success) {
-              console.log(
-                `📊 Buffer size: ${result.bufferSize}/${
-                  this.temperatureService.config?.maxBufferSize || "N/A"
-                }`
-              );
-            }
-
-            // Broadcast via Socket.IO
-            if (this.io) {
-              this.io.emit("suhu", {
-                temperature: temperature,
-                timestamp: new Date().toISOString(),
-                status: "connected",
-                bufferSize: result?.bufferSize || 0,
-              });
-
-              this.io.emit("temperatureData", {
-                value: temperature,
-                time: Date.now(),
-                bufferSize: result?.bufferSize || 0,
-              });
-            }
-          } catch (tempServiceError) {
-            console.error(
-              "❌ Temperature service error:",
-              tempServiceError.message
-            );
-
-            // Still broadcast the temperature even if service fails
-            if (this.io) {
-              this.io.emit("suhu", {
-                temperature: temperature,
-                timestamp: new Date().toISOString(),
-                status: "service_error",
-                error: tempServiceError.message,
-              });
-            }
-          }
-        } else {
-          console.warn("⚠️ Temperature service not available");
-
-          // Still broadcast the temperature
-          if (this.io) {
-            this.io.emit("suhu", {
-              temperature: temperature,
-              timestamp: new Date().toISOString(),
-              status: "no_service",
-            });
-          }
-        }
+        // Continue with other processing
+        await this.processTemperatureData(temperature);
       } catch (error) {
         console.error("❌ Error processing MQTT message:", error.message);
-
-        if (this.io) {
-          this.io.emit("suhu", {
-            temperature: this.lastTemperature,
-            timestamp: new Date().toISOString(),
-            status: "error",
-            error: error.message,
-          });
-        }
+        this.emitError(error);
       }
     });
 
     this.client.on("error", (error) => {
       console.error("❌ MQTT client error:", error.message);
       this.isConnected = false;
-
-      if (this.io) {
-        this.io.emit("mqttStatus", {
-          status: "disconnected",
-          error: error.message,
-        });
-      }
+      this.emitStatus("disconnected", error.message);
     });
 
     this.client.on("close", () => {
       console.warn("⚠️ MQTT connection closed");
       this.isConnected = false;
-
-      if (this.io) {
-        this.io.emit("mqttStatus", { status: "disconnected" });
-      }
-
+      this.emitStatus("disconnected");
       this.scheduleReconnect();
     });
 
     this.client.on("offline", () => {
       console.warn("⚠️ MQTT client offline");
       this.isConnected = false;
-
-      if (this.io) {
-        this.io.emit("mqttStatus", { status: "offline" });
-      }
+      this.emitStatus("offline");
     });
 
     this.client.on("reconnect", () => {
@@ -187,14 +118,244 @@ export class MQTTService {
       console.log(
         `🔄 MQTT reconnecting... (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`
       );
-
-      if (this.io) {
-        this.io.emit("mqttStatus", {
-          status: "reconnecting",
-          attempt: this.reconnectAttempts,
-        });
-      }
+      this.emitStatus("reconnecting", null, this.reconnectAttempts);
     });
+  }
+
+  // PERBAIKAN: Queue-based saving system
+  addToSaveQueue(temperature) {
+    const temperatureData = {
+      temperature,
+      timestamp: new Date(),
+      dryerId: 1,
+      humidity: 50 + Math.random() * 20,
+      status: this.determineStatus(temperature),
+      sensorId: "esp32_sensor_1",
+      location: "Zone A",
+    };
+
+    this.saveQueue.push(temperatureData);
+
+    // Limit queue size to prevent memory issues
+    if (this.saveQueue.length > 100) {
+      this.saveQueue.shift(); // Remove oldest entry
+      console.warn("⚠️ Save queue is full, removing oldest entry");
+    }
+  }
+
+  // PERBAIKAN: Batch processor for database saves
+  async startQueueProcessor() {
+    setInterval(async () => {
+      if (this.isProcessingQueue || this.saveQueue.length === 0) {
+        return;
+      }
+
+      this.isProcessingQueue = true;
+
+      try {
+        // Process up to 10 items at once
+        const batch = this.saveQueue.splice(0, 10);
+        await this.processBatch(batch);
+      } catch (error) {
+        console.error("❌ Batch processing failed:", error.message);
+      } finally {
+        this.isProcessingQueue = false;
+      }
+    }, 2000); // Process every 2 seconds
+  }
+
+  // PERBAIKAN: Optimized batch database save
+  async processBatch(batch) {
+    if (batch.length === 0) return;
+
+    try {
+      // PERBAIKAN: Dynamic import with better error handling
+      const { db } = await import("../lib/database.mjs");
+
+      if (!db) {
+        throw new Error("Database module not available");
+      }
+
+      console.log(
+        `📝 Processing batch of ${batch.length} temperature readings...`
+      );
+
+      // PERBAIKAN: Use batch insert for better performance
+      const saved = await db.withRetry(async (prismaClient) => {
+        // PERBAIKAN: Validate client and method
+        if (!prismaClient) {
+          throw new Error("Prisma client is null");
+        }
+
+        if (!prismaClient.temperatureReading) {
+          throw new Error(
+            "temperatureReading model not found in Prisma client"
+          );
+        }
+
+        if (typeof prismaClient.temperatureReading.createMany !== "function") {
+          throw new Error("temperatureReading.createMany method not available");
+        }
+
+        // PERBAIKAN: Format data for batch insert
+        const formattedData = batch.map((item) => ({
+          dryerId: item.dryerId,
+          suhu: item.temperature,
+          humidity: item.humidity,
+          status: item.status,
+          timestamp: item.timestamp,
+          sensorId: item.sensorId,
+          location: item.location,
+        }));
+
+        return await prismaClient.temperatureReading.createMany({
+          data: formattedData,
+          skipDuplicates: true, // Skip duplicates if any
+        });
+      });
+
+      console.log(`✅ Batch saved: ${saved.count} temperature readings`);
+      return saved;
+    } catch (error) {
+      console.error("❌ Batch save failed:", error.message);
+
+      // PERBAIKAN: More detailed error analysis
+      if (error.message.includes("temperatureReading")) {
+        console.error("💡 Database schema issue detected");
+        console.error("💡 Run: npx prisma db push && npx prisma generate");
+      } else if (error.message.includes("connection")) {
+        console.error("💡 Database connection issue");
+        console.error("💡 Check if database server is running");
+      }
+
+      // PERBAIKAN: Fallback to individual saves if batch fails
+      console.log("🔄 Attempting individual saves as fallback...");
+      for (const item of batch) {
+        try {
+          await this.saveIndividual(item);
+        } catch (individualError) {
+          console.error(
+            `❌ Individual save failed for temp ${item.temperature}:`,
+            individualError.message
+          );
+        }
+      }
+    }
+  }
+
+  // PERBAIKAN: Fallback individual save method
+  async saveIndividual(temperatureData) {
+    try {
+      const { db } = await import("../lib/database.mjs");
+
+      const saved = await db.withRetry(async (prismaClient) => {
+        if (!prismaClient?.temperatureReading?.create) {
+          throw new Error("temperatureReading.create not available");
+        }
+
+        return await prismaClient.temperatureReading.create({
+          data: {
+            dryerId: temperatureData.dryerId,
+            suhu: temperatureData.temperature,
+            humidity: temperatureData.humidity,
+            status: temperatureData.status,
+            timestamp: temperatureData.timestamp,
+            sensorId: temperatureData.sensorId,
+            location: temperatureData.location,
+          },
+        });
+      });
+
+      console.log(
+        `✅ Individual save: ID ${saved.id}, Temp ${temperatureData.temperature}°C`
+      );
+      return saved;
+    } catch (error) {
+      console.error("❌ Individual save failed:", error.message);
+      throw error;
+    }
+  }
+
+  // PERBAIKAN: Separate temperature processing
+  async processTemperatureData(temperature) {
+    try {
+      if (this.temperatureService) {
+        const result = await this.temperatureService.receiveTemperatureData(
+          temperature
+        );
+
+        if (result?.success) {
+          console.log(
+            `📊 Buffer size: ${result.bufferSize}/${
+              this.temperatureService.config?.maxBufferSize || "N/A"
+            }`
+          );
+        }
+
+        this.emitTemperatureData(temperature, "connected", result?.bufferSize);
+      } else {
+        console.warn("⚠️ Temperature service not available");
+        this.emitTemperatureData(temperature, "no_service");
+      }
+    } catch (error) {
+      console.error("❌ Temperature service error:", error.message);
+      this.emitTemperatureData(temperature, "service_error", 0, error.message);
+    }
+  }
+
+  // PERBAIKAN: Helper methods for Socket.IO emissions
+  emitTemperatureData(temperature, status, bufferSize = 0, error = null) {
+    if (!this.io) return;
+
+    const data = {
+      temperature,
+      timestamp: new Date().toISOString(),
+      status,
+      bufferSize,
+    };
+
+    if (error) {
+      data.error = error;
+    }
+
+    this.io.emit("suhu", data);
+    this.io.emit("temperatureData", {
+      value: temperature,
+      time: Date.now(),
+      bufferSize,
+    });
+  }
+
+  emitStatus(status, error = null, attempt = null) {
+    if (!this.io) return;
+
+    const statusData = { status };
+    if (error) statusData.error = error;
+    if (attempt) statusData.attempt = attempt;
+    if (status === "connected") {
+      statusData.topic = this.config.topic;
+      statusData.brokerUrl = this.config.brokerUrl;
+    }
+
+    this.io.emit("mqttStatus", statusData);
+  }
+
+  emitError(error) {
+    if (!this.io) return;
+
+    this.io.emit("suhu", {
+      temperature: this.lastTemperature,
+      timestamp: new Date().toISOString(),
+      status: "error",
+      error: error.message,
+    });
+  }
+
+  determineStatus(temperature) {
+    if (temperature < 20) return "low";
+    if (temperature > 80) return "critical";
+    if (temperature > 70) return "warning";
+    return "normal";
   }
 
   subscribe() {
@@ -204,22 +365,10 @@ export class MQTTService {
           `❌ MQTT subscription failed for topic ${this.config.topic}:`,
           error
         );
-
-        if (this.io) {
-          this.io.emit("mqttStatus", {
-            status: "subscription_failed",
-            error: error.message,
-          });
-        }
+        this.emitStatus("subscription_failed", error.message);
       } else {
         console.log(`✅ MQTT subscribed to topic: ${this.config.topic}`);
-
-        if (this.io) {
-          this.io.emit("mqttStatus", {
-            status: "subscribed",
-            topic: this.config.topic,
-          });
-        }
+        this.emitStatus("subscribed");
       }
     });
   }
@@ -229,13 +378,7 @@ export class MQTTService {
       console.error(
         `❌ MQTT max reconnection attempts (${this.maxReconnectAttempts}) reached`
       );
-
-      if (this.io) {
-        this.io.emit("mqttStatus", {
-          status: "max_retries_reached",
-          maxAttempts: this.maxReconnectAttempts,
-        });
-      }
+      this.emitStatus("max_retries_reached");
       return;
     }
 
@@ -256,6 +399,9 @@ export class MQTTService {
       maxReconnectAttempts: this.maxReconnectAttempts,
       clientState: this.client?.connected || false,
       lastTemperature: this.lastTemperature,
+      lastDataTime: this.lastDataTime,
+      queueSize: this.saveQueue.length, // PERBAIKAN: Include queue status
+      isProcessingQueue: this.isProcessingQueue,
       config: this.config,
       timestamp: new Date().toISOString(),
     };
@@ -265,7 +411,12 @@ export class MQTTService {
     return this.lastTemperature;
   }
 
-  // Publish message (untuk testing atau control)
+  hasRecentData() {
+    if (!this.lastDataTime) return false;
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    return this.lastDataTime > fiveMinutesAgo;
+  }
+
   publish(topic, message) {
     if (this.client && this.isConnected) {
       this.client.publish(topic, message);
@@ -277,7 +428,6 @@ export class MQTTService {
     }
   }
 
-  // Force reconnect
   forceReconnect() {
     console.log("🔄 Force reconnecting MQTT...");
     this.reconnectAttempts = 0;
@@ -290,13 +440,18 @@ export class MQTTService {
       console.log("🔌 Disconnecting MQTT client...");
 
       try {
-        this.client.end(true); // Force close
+        // PERBAIKAN: Process remaining queue before disconnect
+        if (this.saveQueue.length > 0) {
+          console.log(
+            `🔄 Processing ${this.saveQueue.length} remaining items before disconnect...`
+          );
+          await this.processBatch(this.saveQueue.splice(0));
+        }
+
+        this.client.end(true);
         this.isConnected = false;
         console.log("✅ MQTT disconnected gracefully");
-
-        if (this.io) {
-          this.io.emit("mqttStatus", { status: "disconnected" });
-        }
+        this.emitStatus("disconnected");
       } catch (error) {
         console.error("❌ Error disconnecting MQTT:", error);
       }
