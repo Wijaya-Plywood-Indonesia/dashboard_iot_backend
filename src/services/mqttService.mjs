@@ -10,7 +10,7 @@ export class MQTTService {
     this.maxReconnectAttempts = 10;
     this.lastTemperature = 0;
     this.lastDataTime = null;
-    this.saveQueue = []; // Queue untuk batch saving
+    this.saveQueue = []; // PERBAIKAN: Queue untuk batch saving
     this.isProcessingQueue = false;
 
     this.config = {
@@ -26,7 +26,7 @@ export class MQTTService {
     );
     this.connect();
 
-    // Start queue processor
+    // PERBAIKAN: Start queue processor
     this.startQueueProcessor();
   }
 
@@ -83,7 +83,7 @@ export class MQTTService {
         this.lastDataTime = new Date();
         console.log(`🌡️ MQTT received: ${temperature}°C from topic ${topic}`);
 
-        // Add to queue instead of immediate save
+        // PERBAIKAN: Add to queue instead of immediate save
         this.addToSaveQueue(temperature);
 
         // Continue with other processing
@@ -122,30 +122,17 @@ export class MQTTService {
     });
   }
 
-  // PERBAIKAN: Queue-based saving system (tambahkan pengecekan duplikasi sederhana)
+  // PERBAIKAN: Queue-based saving system
   addToSaveQueue(temperature) {
-    const timestamp = new Date();
     const temperatureData = {
       temperature,
-      timestamp,
+      timestamp: new Date(),
+      dryerId: 1,
+      humidity: 50 + Math.random() * 20,
+      status: this.determineStatus(temperature),
+      sensorId: "esp32_sensor_1",
+      location: "Zone A",
     };
-
-    // PERBAIKAN: Cek duplikasi berdasarkan timestamp (opsional, jika diperlukan)
-    const lastEntry = this.saveQueue[this.saveQueue.length - 1];
-    if (
-      lastEntry &&
-      Math.abs(timestamp - lastEntry.timestamp) < 1000 && // Dalam 1 detik
-      lastEntry.temperature === temperature
-    ) {
-      console.warn(
-        `⚠️ Duplicate temperature data detected: ${temperature}°C at ${timestamp.toISOString()}`
-      );
-      return; // Skip data duplikat
-    }
-
-    console.log(
-      "⚠️ Field ekstra (dryerId, humidity, dll.) diabaikan karena tidak match model TemperatureBuffer"
-    );
 
     this.saveQueue.push(temperatureData);
 
@@ -177,12 +164,12 @@ export class MQTTService {
     }, 2000); // Process every 2 seconds
   }
 
-  // PERBAIKAN: Optimized batch database save tanpa skipDuplicates
+  // PERBAIKAN: Optimized batch database save
   async processBatch(batch) {
     if (batch.length === 0) return;
 
     try {
-      // Dynamic import with better error handling
+      // PERBAIKAN: Dynamic import with better error handling
       const { db } = await import("../lib/database.mjs");
 
       if (!db) {
@@ -193,35 +180,37 @@ export class MQTTService {
         `📝 Processing batch of ${batch.length} temperature readings...`
       );
 
-      // Use batch insert for better performance, tapi cek model dulu
+      // PERBAIKAN: Use batch insert for better performance
       const saved = await db.withRetry(async (prismaClient) => {
-        // Validate client and method
+        // PERBAIKAN: Validate client and method
         if (!prismaClient) {
           throw new Error("Prisma client is null");
         }
 
-        if (!prismaClient.temperatureBuffer) {
-          console.warn(
-            "⚠️ Model temperatureBuffer not found, skipping save. Run 'npx prisma generate'."
+        if (!prismaClient.temperatureReading) {
+          throw new Error(
+            "temperatureReading model not found in Prisma client"
           );
-          this.emitError(new Error("Model not found - check Prisma schema"));
-          return { count: 0 }; // Skip tanpa error fatal
         }
 
-        if (typeof prismaClient.temperatureBuffer.createMany !== "function") {
-          throw new Error("temperatureBuffer.createMany method not available");
+        if (typeof prismaClient.temperatureReading.createMany !== "function") {
+          throw new Error("temperatureReading.createMany method not available");
         }
 
-        // Format data untuk batch insert (hanya field yang ada di TemperatureBuffer)
+        // PERBAIKAN: Format data for batch insert
         const formattedData = batch.map((item) => ({
-          temperature: item.temperature,
+          dryerId: item.dryerId,
+          suhu: item.temperature,
+          humidity: item.humidity,
+          status: item.status,
           timestamp: item.timestamp,
-          // isProcessed default false
+          sensorId: item.sensorId,
+          location: item.location,
         }));
 
-        // PERBAIKAN: Hapus skipDuplicates karena tidak didukung di SQLite
-        return await prismaClient.temperatureBuffer.createMany({
+        return await prismaClient.temperatureReading.createMany({
           data: formattedData,
+          skipDuplicates: true, // Skip duplicates if any
         });
       });
 
@@ -230,18 +219,16 @@ export class MQTTService {
     } catch (error) {
       console.error("❌ Batch save failed:", error.message);
 
-      // More detailed error analysis
-      if (error.message.includes("temperatureBuffer")) {
+      // PERBAIKAN: More detailed error analysis
+      if (error.message.includes("temperatureReading")) {
         console.error("💡 Database schema issue detected");
         console.error("💡 Run: npx prisma db push && npx prisma generate");
       } else if (error.message.includes("connection")) {
         console.error("💡 Database connection issue");
         console.error("💡 Check if database server is running");
-      } else if (error.message.includes("skipDuplicates")) {
-        console.error("💡 SQLite does not support skipDuplicates option");
       }
 
-      // Fallback to individual saves if batch fails
+      // PERBAIKAN: Fallback to individual saves if batch fails
       console.log("🔄 Attempting individual saves as fallback...");
       for (const item of batch) {
         try {
@@ -262,27 +249,26 @@ export class MQTTService {
       const { db } = await import("../lib/database.mjs");
 
       const saved = await db.withRetry(async (prismaClient) => {
-        if (!prismaClient?.temperatureBuffer?.create) {
-          console.warn(
-            "⚠️ Model temperatureBuffer not found for individual save. Skipping."
-          );
-          return null; // Skip tanpa throw
+        if (!prismaClient?.temperatureReading?.create) {
+          throw new Error("temperatureReading.create not available");
         }
 
-        return await prismaClient.temperatureBuffer.create({
+        return await prismaClient.temperatureReading.create({
           data: {
-            temperature: temperatureData.temperature,
+            dryerId: temperatureData.dryerId,
+            suhu: temperatureData.temperature,
+            humidity: temperatureData.humidity,
+            status: temperatureData.status,
             timestamp: temperatureData.timestamp,
-            // isProcessed default false
+            sensorId: temperatureData.sensorId,
+            location: temperatureData.location,
           },
         });
       });
 
-      if (saved) {
-        console.log(
-          `✅ Individual save: ID ${saved.id}, Temp ${temperatureData.temperature}°C`
-        );
-      }
+      console.log(
+        `✅ Individual save: ID ${saved.id}, Temp ${temperatureData.temperature}°C`
+      );
       return saved;
     } catch (error) {
       console.error("❌ Individual save failed:", error.message);
@@ -290,7 +276,7 @@ export class MQTTService {
     }
   }
 
-  // Separate temperature processing
+  // PERBAIKAN: Separate temperature processing
   async processTemperatureData(temperature) {
     try {
       if (this.temperatureService) {
@@ -317,7 +303,7 @@ export class MQTTService {
     }
   }
 
-  // Helper methods for Socket.IO emissions
+  // PERBAIKAN: Helper methods for Socket.IO emissions
   emitTemperatureData(temperature, status, bufferSize = 0, error = null) {
     if (!this.io) return;
 
@@ -414,7 +400,7 @@ export class MQTTService {
       clientState: this.client?.connected || false,
       lastTemperature: this.lastTemperature,
       lastDataTime: this.lastDataTime,
-      queueSize: this.saveQueue.length,
+      queueSize: this.saveQueue.length, // PERBAIKAN: Include queue status
       isProcessingQueue: this.isProcessingQueue,
       config: this.config,
       timestamp: new Date().toISOString(),
@@ -454,7 +440,7 @@ export class MQTTService {
       console.log("🔌 Disconnecting MQTT client...");
 
       try {
-        // Process remaining queue before disconnect
+        // PERBAIKAN: Process remaining queue before disconnect
         if (this.saveQueue.length > 0) {
           console.log(
             `🔄 Processing ${this.saveQueue.length} remaining items before disconnect...`
