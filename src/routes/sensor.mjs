@@ -143,14 +143,13 @@ router.get(
 
       // Get recent readings from database
       const recentReadings = await db.withRetry(async (prisma) => {
-        return await prisma.temperatureReading.findMany({
+        return await prisma.temperatureBuffer.findMany({
           where: {
             timestamp: {
               gte: new Date(Date.now() - 10 * 60 * 1000), // Last 10 minutes
             },
           },
           orderBy: { timestamp: "desc" },
-          distinct: ["dryerId"],
           take: 10,
         });
       });

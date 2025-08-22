@@ -1,5 +1,6 @@
 import express from "express";
 import { asyncHandler } from "../middleware/errorMiddleware.mjs";
+import { db } from "../lib/database.mjs";
 
 const router = express.Router();
 
@@ -7,8 +8,6 @@ const router = express.Router();
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const { temperatureService, mqttService } = req.services;
-
     const healthStatus = {
       status: "healthy",
       timestamp: new Date().toISOString(),
@@ -22,52 +21,31 @@ router.get(
       services: {},
     };
 
-    // Check Temperature Service
+    // Check Database
     try {
-      if (temperatureService) {
-        const tempStatus = await temperatureService.getSystemStatus();
-        healthStatus.services.temperature = {
-          status: tempStatus.status === "healthy" ? "healthy" : "degraded",
-          details: tempStatus,
-        };
-      } else {
-        healthStatus.services.temperature = {
-          status: "unavailable",
-          message: "Service not initialized",
-        };
-      }
+      const dbHealth = await db.healthCheck();
+      healthStatus.services.database = {
+        status: dbHealth.connected ? "healthy" : "error",
+        details: dbHealth,
+      };
     } catch (error) {
-      healthStatus.services.temperature = {
+      healthStatus.services.database = {
         status: "error",
         message: error.message,
       };
+      healthStatus.status = "degraded";
     }
 
-    // Check MQTT Service
-    try {
-      if (mqttService) {
-        const mqttStatus = mqttService.getStatus();
-        healthStatus.services.mqtt = {
-          status: mqttStatus.connected ? "healthy" : "degraded",
-          details: {
-            connected: mqttStatus.connected,
-            broker: mqttStatus.brokerUrl,
-            topic: mqttStatus.topic,
-            lastTemperature: mqttStatus.lastTemperature,
-          },
-        };
-      } else {
-        healthStatus.services.mqtt = {
-          status: "unavailable",
-          message: "Service not initialized",
-        };
-      }
-    } catch (error) {
-      healthStatus.services.mqtt = {
-        status: "error",
-        message: error.message,
-      };
-    }
+    // Simple response for now - services will be checked differently
+    healthStatus.services.mqtt = {
+      status: "unknown",
+      message: "MQTT status check not implemented yet",
+    };
+
+    healthStatus.services.temperature = {
+      status: "unknown",
+      message: "Temperature service status check not implemented yet",
+    };
 
     // Overall status
     const serviceStatuses = Object.values(healthStatus.services).map(
@@ -96,46 +74,18 @@ router.get("/live", (req, res) => {
 router.get(
   "/ready",
   asyncHandler(async (req, res) => {
-    const { temperatureService, mqttService } = req.services;
-
     const checks = {
       database: false,
-      temperature: false,
-      mqtt: false,
     };
 
     // Database check
     try {
-      const { db } = await import("../lib/database.mjs");
       await db.withRetry(async (prisma) => {
         await prisma.$queryRaw`SELECT 1`;
       });
       checks.database = true;
     } catch (error) {
       console.error("Database readiness check failed:", error.message);
-    }
-
-    // Temperature service check
-    try {
-      if (temperatureService) {
-        const status = await temperatureService.getSystemStatus();
-        checks.temperature = status.status === "healthy";
-      }
-    } catch (error) {
-      console.error(
-        "Temperature service readiness check failed:",
-        error.message
-      );
-    }
-
-    // MQTT service check
-    try {
-      if (mqttService) {
-        const status = mqttService.getStatus();
-        checks.mqtt = status.connected;
-      }
-    } catch (error) {
-      console.error("MQTT service readiness check failed:", error.message);
     }
 
     const isReady = Object.values(checks).every((check) => check);

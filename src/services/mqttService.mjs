@@ -187,30 +187,23 @@ export class MQTTService {
           throw new Error("Prisma client is null");
         }
 
-        if (!prismaClient.temperatureReading) {
-          throw new Error(
-            "temperatureReading model not found in Prisma client"
-          );
+        if (!prismaClient.temperatureBuffer) {
+          throw new Error("temperatureBuffer model not found in Prisma client");
         }
 
-        if (typeof prismaClient.temperatureReading.createMany !== "function") {
-          throw new Error("temperatureReading.createMany method not available");
+        if (typeof prismaClient.temperatureBuffer.createMany !== "function") {
+          throw new Error("temperatureBuffer.createMany method not available");
         }
 
-        // PERBAIKAN: Format data for batch insert
+        // PERBAIKAN: Format data for TemperatureBuffer table
         const formattedData = batch.map((item) => ({
-          dryerId: item.dryerId,
-          suhu: item.temperature,
-          humidity: item.humidity,
-          status: item.status,
+          temperature: item.temperature,
           timestamp: item.timestamp,
-          sensorId: item.sensorId,
-          location: item.location,
+          isProcessed: false,
         }));
 
-        return await prismaClient.temperatureReading.createMany({
+        return await prismaClient.temperatureBuffer.createMany({
           data: formattedData,
-          skipDuplicates: true, // Skip duplicates if any
         });
       });
 
@@ -220,7 +213,7 @@ export class MQTTService {
       console.error("❌ Batch save failed:", error.message);
 
       // PERBAIKAN: More detailed error analysis
-      if (error.message.includes("temperatureReading")) {
+      if (error.message.includes("temperatureBuffer")) {
         console.error("💡 Database schema issue detected");
         console.error("💡 Run: npx prisma db push && npx prisma generate");
       } else if (error.message.includes("connection")) {
@@ -249,19 +242,15 @@ export class MQTTService {
       const { db } = await import("../lib/database.mjs");
 
       const saved = await db.withRetry(async (prismaClient) => {
-        if (!prismaClient?.temperatureReading?.create) {
-          throw new Error("temperatureReading.create not available");
+        if (!prismaClient?.temperatureBuffer?.create) {
+          throw new Error("temperatureBuffer.create not available");
         }
 
-        return await prismaClient.temperatureReading.create({
+        return await prismaClient.temperatureBuffer.create({
           data: {
-            dryerId: temperatureData.dryerId,
-            suhu: temperatureData.temperature,
-            humidity: temperatureData.humidity,
-            status: temperatureData.status,
+            temperature: temperatureData.temperature,
             timestamp: temperatureData.timestamp,
-            sensorId: temperatureData.sensorId,
-            location: temperatureData.location,
+            isProcessed: false,
           },
         });
       });
