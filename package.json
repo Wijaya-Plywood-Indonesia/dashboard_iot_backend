@@ -6,11 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "db:generate": "npx prisma generate",
-    "db:push": "npx prisma db push",
-    "db:migrate": "npx prisma migrate dev",
-    "db:studio": "npx prisma studio",
-    "db:reset": "npx prisma migrate reset",
+    "postinstall": "prisma generate",
     "export:manual": "node scripts/manual-export.mjs",
     "setup": "npm install && npm run db:generate && npm run db:push",
     "test": "echo \"Error: no test specified\" && exit 1"
