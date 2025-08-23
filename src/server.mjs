@@ -81,6 +81,15 @@ app.use(limiter);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
+// PERBAIKAN: Middleware untuk inject services ke req
+app.use((req, res, next) => {
+  req.services = {
+    temperatureService: app.locals.temperatureService,
+    mqttService: app.locals.mqttService,
+  };
+  next();
+});
+
 // PERBAIKAN: Initialize services dengan proper order
 let temperatureService;
 let mqttService;
@@ -95,6 +104,13 @@ async function initializeServices() {
 
     console.log("🔧 Initializing MQTT Service...");
     mqttService = new MQTTService(temperatureService, io);
+
+    // PERBAIKAN: Set global IO untuk notifikasi export
+    global.io = io;
+
+    // PERBAIKAN: Make services available to routes
+    app.locals.temperatureService = temperatureService;
+    app.locals.mqttService = mqttService;
 
     console.log("✅ All services initialized successfully");
 
@@ -178,7 +194,7 @@ app.use("/api/sensor", sensorRoutes);
 app.use("/api/health", healthRoutes);
 app.use("/api/backup", backupRoutes);
 
-// PERBAIKAN: System info endpoint
+// PERBAIKAN: System info endpoint dengan 6-hour export status
 app.get("/api/system/info", async (req, res) => {
   try {
     const systemInfo = {
@@ -195,7 +211,17 @@ app.get("/api/system/info", async (req, res) => {
           status: temperatureService ? "active" : "inactive",
           bufferSize: temperatureService?.state?.bufferData?.length || 0,
           lastProcessed: temperatureService?.state?.lastSavedMinute || null,
+          lastSixHourExport:
+            temperatureService?.exportConfig?.lastSixHourExport || null,
         },
+      },
+      sixHourExport: {
+        enabled: true,
+        intervalMs:
+          temperatureService?.exportConfig?.sixHourIntervalMs || 21600000,
+        nextExportEstimate: temperatureService
+          ? this.calculateNextExport()
+          : null,
       },
       timestamp: new Date().toISOString(),
     };
@@ -212,6 +238,63 @@ app.get("/api/system/info", async (req, res) => {
     });
   }
 });
+
+// PERBAIKAN: Endpoint untuk mendapatkan pending 6-hour exports
+app.get("/api/system/six-hour-exports/pending", async (req, res) => {
+  try {
+    const pendingExports = await db.withRetry(async (prisma) => {
+      return await prisma.sixHourExport.findMany({
+        where: {
+          isReady: true,
+          downloadNotified: false,
+        },
+        orderBy: { createdAt: "desc" },
+        take: 10,
+      });
+    });
+
+    res.json({
+      success: true,
+      message: "Pending 6-hour exports retrieved successfully",
+      data: pendingExports,
+      count: pendingExports.length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Error getting pending exports:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// PERBAIKAN: Helper function untuk kalkulasi next export
+function calculateNextExport() {
+  const now = new Date();
+  const currentHour = now.getHours();
+  let nextExportHour;
+
+  if (currentHour < 6) {
+    nextExportHour = 6;
+  } else if (currentHour < 12) {
+    nextExportHour = 12;
+  } else if (currentHour < 18) {
+    nextExportHour = 18;
+  } else {
+    nextExportHour = 24; // Next day at 00:00
+  }
+
+  const nextExport = new Date(now);
+  if (nextExportHour === 24) {
+    nextExport.setDate(nextExport.getDate() + 1);
+    nextExport.setHours(0, 0, 0, 0);
+  } else {
+    nextExport.setHours(nextExportHour, 0, 0, 0);
+  }
+
+  return nextExport.toISOString();
+}
 
 // Error handling middleware
 app.use(notFoundHandler);

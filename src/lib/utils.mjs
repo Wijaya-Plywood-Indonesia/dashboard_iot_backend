@@ -243,7 +243,28 @@ export const logWithTimestamp = (level, message, metadata = {}) => {
   console.log(`${emoji} [${timestamp}] ${message}`);
 
   if (Object.keys(metadata).length > 0) {
-    console.log("   Metadata:", metadata);
+    // Safely handle metadata to avoid circular references
+    try {
+      const safeMetadata = JSON.parse(
+        JSON.stringify(metadata, (key, value) => {
+          if (typeof value === "object" && value !== null) {
+            // Skip circular references and large objects
+            if (
+              value.constructor &&
+              (value.constructor.name === "IncomingMessage" ||
+                value.constructor.name === "ServerResponse" ||
+                value.constructor.name === "Socket")
+            ) {
+              return "[Complex Object]";
+            }
+          }
+          return value;
+        })
+      );
+      console.log("   Metadata:", safeMetadata);
+    } catch (error) {
+      console.log("   Metadata: [Could not serialize metadata]");
+    }
   }
 };
 

@@ -33,9 +33,30 @@ model TemperatureAggregate {
   sampleCount     Int      @map("jumlah_sample")
   createdAt       DateTime @default(now()) @map("dibuat_pada")
   isExported      Boolean  @default(false) @map("sudah_dieksport")
+  isSixHourExported Boolean @default(false) @map("sudah_dieksport_6jam")
+  sixHourBatch    String?  @map("batch_6jam") // Format: "2024-01-15_00-06", "2024-01-15_06-12", etc
   
   @@unique([date, timeSlot])
   @@map("agregasi_suhu")
+}
+
+// Tabel untuk export 6 jam
+model SixHourExport {
+  id              Int      @id @default(autoincrement())
+  batchId         String   @unique @map("batch_id") // Format: "2024-01-15_00-06"
+  startTime       DateTime @map("waktu_mulai")
+  endTime         DateTime @map("waktu_selesai")
+  csvFilePath     String?  @map("file_csv")
+  excelFilePath   String?  @map("file_excel")
+  totalRecords    Int      @map("total_record")
+  avgTemp         Float    @map("rata_suhu")
+  minTemp         Float    @map("min_suhu")
+  maxTemp         Float    @map("max_suhu")
+  isReady         Boolean  @default(true) @map("siap_download")
+  downloadNotified Boolean @default(false) @map("notifikasi_terkirim")
+  createdAt       DateTime @default(now()) @map("dibuat_pada")
+  
+  @@map("export_6_jam")
 }
 
 // Tabel untuk backup data harian (setelah export)

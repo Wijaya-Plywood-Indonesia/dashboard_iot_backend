@@ -16,7 +16,9 @@ router.get(
       const { date } = req.params;
 
       console.log(
-        `📈 Historical data requested for date: ${date} by user: ${req.user?.username}`
+        `📈 Historical data requested for date: ${date} by user: ${
+          req.user?.username || "anonymous"
+        }`
       );
 
       // Validasi format tanggal
@@ -138,7 +140,9 @@ router.get(
   verifyToken,
   asyncHandler(async (req, res) => {
     try {
-      console.log(`📡 /sensor/current hit by user: ${req.user.username}`);
+      console.log(
+        `📡 /sensor/current hit by user: ${req.user?.username || "anonymous"}`
+      );
 
       const { db } = await import("../lib/database.mjs");
 
@@ -158,54 +162,38 @@ router.get(
       if (recentReadings.length === 0) {
         console.log("⚠️ No recent readings found, returning simulation data");
 
-        // Return simulation data jika tidak ada data real
-        const simulationData = {
-          1: {
-            dryerId: 1,
-            suhu: 25.5 + Math.random() * 5,
-            humidity: 50 + Math.random() * 10,
-            status: "normal",
-            timestamp: new Date(),
-            sensorId: "sensor_1",
-            location: "Zone A",
-          },
-        };
-
+        // Return simple structure yang diharapkan frontend
         return res.json({
           success: true,
           message: "No recent data - using simulation",
-          data: simulationData,
-          usingSimulation: true,
+          data: {
+            temperature: 25.5 + Math.random() * 5,
+            humidity: 50 + Math.random() * 10,
+            isConnected: false,
+            timestamp: new Date().toISOString(),
+            lastUpdate: new Date().toISOString(),
+          },
           timestamp: new Date().toISOString(),
         });
       }
 
-      // Process real data
-      const dryersData = {};
-      recentReadings.forEach((reading) => {
-        dryersData[reading.dryerId] = {
-          dryerId: reading.dryerId,
-          suhu: reading.suhu,
-          humidity: reading.humidity || 0,
-          status: reading.status || "normal",
-          timestamp: reading.timestamp,
-          sensorId: reading.sensorId || `sensor_${reading.dryerId}`,
-          location:
-            reading.location ||
-            `Zone ${String.fromCharCode(64 + reading.dryerId)}`,
-        };
-      });
+      // Process real data - ambil reading terbaru
+      const latestReading = recentReadings[0];
 
-      console.log(
-        `✅ Retrieved real data for ${Object.keys(dryersData).length} dryers`
-      );
+      console.log(`✅ Retrieved real data: ${latestReading.suhu}°C`);
 
       res.json({
         success: true,
         message: "Current temperature data retrieved from ESP32",
-        data: dryersData,
-        count: Object.keys(dryersData).length,
-        usingSimulation: false,
+        data: {
+          temperature: latestReading.suhu,
+          humidity: latestReading.humidity || 0,
+          isConnected: true,
+          timestamp: latestReading.timestamp.toISOString(),
+          lastUpdate: latestReading.timestamp.toISOString(),
+          dryerId: latestReading.dryerId,
+          sensorId: latestReading.sensorId,
+        },
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -376,6 +364,7 @@ router.get(
 );
 
 // Get today's aggregate data
+// Getting today's aggregate data
 router.get(
   "/aggregate/today",
   verifyToken,
@@ -674,5 +663,435 @@ router.get(
     }
   })
 );
+
+// PERBAIKAN: Tambah route realtime stats yang hilang
+router.get(
+  "/realtime/stats",
+  asyncHandler(async (req, res) => {
+    try {
+      const { temperatureService, mqttService } = req.services || {};
+
+      // Get real-time statistics
+      const stats = {
+        mqtt: {
+          connected: mqttService?.isConnected || false,
+          lastTemperature: mqttService?.getLastTemperature() || 0,
+          hasRecentData: mqttService?.hasRecentData() || false,
+          queueSize: mqttService?.saveQueue?.length || 0,
+        },
+        temperature: {
+          bufferSize: temperatureService?.state?.bufferData?.length || 0,
+          minuteCount: temperatureService?.state?.minuteDataCount || 0,
+          currentMinute: temperatureService?.state?.currentMinuteStartTime
+            ? temperatureService.formatMinute(
+                temperatureService.state.currentMinuteStartTime
+              )
+            : null,
+          lastProcessedSlot:
+            temperatureService?.state?.lastProcessedSlot || null,
+          isProcessing: temperatureService?.state?.isProcessing || false,
+        },
+        system: {
+          uptime: Math.round(process.uptime()),
+          memory: process.memoryUsage(),
+          timestamp: new Date().toISOString(),
+        },
+      };
+
+      res.json({
+        success: true,
+        message: "Real-time statistics retrieved successfully",
+        data: stats,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error("Error getting realtime stats:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get real-time statistics",
+        error: error.message,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  })
+);
+
+// PERBAIKAN: Route /suhu untuk backward compatibility dengan frontend
+router.get(
+  "/suhu",
+  asyncHandler(async (req, res) => {
+    // Redirect ke endpoint current untuk konsistensi
+    console.log("🔄 /suhu endpoint hit, redirecting to /current");
+
+    try {
+      const { db } = await import("../lib/database.mjs");
+
+      // Get latest temperature reading
+      const latestReading = await db.withRetry(async (prisma) => {
+        return await prisma.temperatureBuffer.findFirst({
+          orderBy: { timestamp: "desc" },
+        });
+      });
+
+      if (!latestReading) {
+        return res.json({
+          success: true,
+          suhu: 25.0 + Math.random() * 5, // Simulation fallback
+          timestamp: new Date().toISOString(),
+          usingSimulation: true,
+          message: "No real data available - using simulation",
+        });
+      }
+
+      res.json({
+        success: true,
+        suhu: latestReading.suhu,
+        timestamp: latestReading.timestamp.toISOString(),
+        usingSimulation: false,
+        dryerId: latestReading.dryerId,
+        message: "Latest temperature from ESP32",
+      });
+    } catch (error) {
+      console.error("❌ /suhu error:", error);
+      res.json({
+        success: true,
+        suhu: 25.0 + Math.random() * 5, // Fallback
+        timestamp: new Date().toISOString(),
+        usingSimulation: true,
+        error: error.message,
+        message: "Database error - using simulation",
+      });
+    }
+  })
+);
+
+// PERBAIKAN: Route /status untuk system status
+router.get(
+  "/status",
+  asyncHandler(async (req, res) => {
+    console.log(
+      `🔧 System status requested by user: ${req.user?.username || "anonymous"}`
+    );
+
+    try {
+      const { temperatureService, mqttService } = req.services;
+
+      const tempStatus = await temperatureService.getSystemStatus();
+      const mqttStatus = mqttService.getConnectionStatus();
+
+      res.json({
+        success: true,
+        message: "System status retrieved successfully",
+        data: {
+          temperature: tempStatus,
+          mqtt: mqttStatus,
+          serverUptime: process.uptime(),
+          timestamp: new Date().toISOString(),
+        },
+        requestedBy: req.user?.username || "anonymous",
+      });
+    } catch (error) {
+      console.error("❌ /status error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get system status",
+        error: error.message,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  })
+);
+
+// Realtime stats endpoint for Charts.jsx
+router.get("/realtime/stats", async (req, res) => {
+  try {
+    console.log("📊 [/realtime/stats] Accessing realtime statistics");
+
+    const { db } = await import("../lib/database.mjs");
+
+    // Get recent readings for stats
+    const recentReadings = await db.temperatureBuffer.findMany({
+      where: {
+        timestamp: {
+          gte: new Date(Date.now() - 60 * 60 * 1000), // Last hour
+        },
+      },
+      orderBy: { timestamp: "desc" },
+      take: 60,
+    });
+
+    if (recentReadings.length === 0) {
+      return res.json({
+        success: true,
+        message: "No recent data available",
+        data: {
+          averageTemp: 25.0,
+          minTemp: 20.0,
+          maxTemp: 30.0,
+          dataPoints: 0,
+          trend: "stable",
+          lastUpdate: new Date().toISOString(),
+        },
+      });
+    }
+
+    // Calculate statistics
+    const temperatures = recentReadings.map((r) => r.suhu);
+    const averageTemp =
+      temperatures.reduce((sum, temp) => sum + temp, 0) / temperatures.length;
+    const minTemp = Math.min(...temperatures);
+    const maxTemp = Math.max(...temperatures);
+
+    // Simple trend calculation (compare last 10 vs previous 10)
+    let trend = "stable";
+    if (temperatures.length >= 20) {
+      const recent10 = temperatures.slice(0, 10);
+      const previous10 = temperatures.slice(10, 20);
+      const recentAvg = recent10.reduce((sum, temp) => sum + temp, 0) / 10;
+      const previousAvg = previous10.reduce((sum, temp) => sum + temp, 0) / 10;
+
+      if (recentAvg > previousAvg + 0.5) trend = "rising";
+      else if (recentAvg < previousAvg - 0.5) trend = "falling";
+    }
+
+    res.json({
+      success: true,
+      message: "Realtime statistics retrieved",
+      data: {
+        averageTemp: Math.round(averageTemp * 100) / 100,
+        minTemp: Math.round(minTemp * 100) / 100,
+        maxTemp: Math.round(maxTemp * 100) / 100,
+        dataPoints: temperatures.length,
+        trend,
+        lastUpdate: recentReadings[0].timestamp.toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("❌ Error in /realtime/stats endpoint:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+});
+
+// Backward compatibility endpoint for frontend that still uses /suhu
+router.get("/suhu", async (req, res) => {
+  try {
+    console.log("📊 [/suhu] Accessing backward compatibility endpoint");
+
+    const { db } = await import("../lib/database.mjs");
+
+    // Ambil data terbaru dari buffer
+    const latest = await db.temperatureBuffer.findFirst({
+      orderBy: { timestamp: "desc" },
+      take: 1,
+    });
+
+    if (!latest) {
+      console.log("⚠️ No data found in buffer, returning simulation");
+      return res.json({
+        success: true,
+        message: "No data available - using simulation",
+        data: {
+          temperature: 28.5 + Math.random() * 3,
+          isConnected: false,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Temperature data retrieved",
+      data: {
+        temperature: latest.suhu,
+        isConnected: true,
+        timestamp: latest.timestamp.toISOString(),
+        humidity: latest.humidity || 0,
+        dryerId: latest.dryerId,
+      },
+    });
+  } catch (error) {
+    console.error("❌ Error in /suhu endpoint:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+});
+
+// Historical data endpoint for Charts.jsx
+router.get("/history/:date", async (req, res) => {
+  try {
+    const { date } = req.params;
+    console.log(`📅 [/history/${date}] Historical data request`);
+
+    const { db } = await import("../lib/database.mjs");
+
+    // Parse date parameter
+    const targetDate = new Date(date);
+    if (isNaN(targetDate.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid date format",
+        error: "Date must be in YYYY-MM-DD format",
+      });
+    }
+
+    const startOfDay = new Date(targetDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(targetDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    // Try to get aggregate data first
+    const aggregateData = await db.temperatureAggregate.findMany({
+      where: {
+        date: {
+          gte: startOfDay,
+          lte: endOfDay,
+        },
+      },
+      orderBy: { timeSlot: "asc" },
+    });
+
+    if (aggregateData.length > 0) {
+      console.log(
+        `✅ Found ${aggregateData.length} aggregate records for ${date}`
+      );
+
+      return res.json({
+        success: true,
+        message: "Historical data from aggregates",
+        data: {
+          source: "aggregate",
+          aggregates: aggregateData,
+          date: date,
+          count: aggregateData.length,
+        },
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // If no aggregate data, try raw data and calculate averages
+    const rawData = await db.temperatureBuffer.findMany({
+      where: {
+        timestamp: {
+          gte: startOfDay,
+          lte: endOfDay,
+        },
+      },
+      orderBy: { timestamp: "asc" },
+    });
+
+    if (rawData.length > 0) {
+      console.log(
+        `✅ Found ${rawData.length} raw records for ${date}, calculating backup stats`
+      );
+
+      const temperatures = rawData.map((item) => item.suhu);
+      const avgDailyTemp =
+        temperatures.reduce((sum, temp) => sum + temp, 0) / temperatures.length;
+      const minDailyTemp = Math.min(...temperatures);
+      const maxDailyTemp = Math.max(...temperatures);
+
+      return res.json({
+        success: true,
+        message: "Historical data from raw buffer",
+        data: {
+          source: "backup",
+          backup: {
+            avgDailyTemp: Math.round(avgDailyTemp * 100) / 100,
+            minDailyTemp,
+            maxDailyTemp,
+            sampleCount: rawData.length,
+          },
+          date: date,
+          count: rawData.length,
+        },
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // No data found
+    console.log(`⚠️ No data found for ${date}`);
+    res.json({
+      success: true,
+      message: "No data available for this date",
+      data: {
+        source: "none",
+        date: date,
+        count: 0,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("❌ Error in /history endpoint:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+});
+
+// System status endpoint
+router.get("/status", async (req, res) => {
+  try {
+    console.log("🏥 [/status] System status check");
+
+    const { db } = await import("../lib/database.mjs");
+
+    // Get database status
+    const bufferCount = await db.temperatureBuffer.count();
+    const aggregateCount = await db.temperatureAggregate.count();
+
+    // Get latest data
+    const latestBuffer = await db.temperatureBuffer.findFirst({
+      orderBy: { timestamp: "desc" },
+    });
+
+    const latestAggregate = await db.temperatureAggregate.findFirst({
+      orderBy: { createdAt: "desc" },
+    });
+
+    const status = {
+      database: {
+        status: "connected",
+        bufferRecords: bufferCount,
+        aggregateRecords: aggregateCount,
+        lastBufferData: latestBuffer?.timestamp || null,
+        lastAggregateData: latestAggregate?.createdAt || null,
+      },
+      services: {
+        mqtt: "connected", // Should check actual MQTT status
+        dataProcessing: "active",
+        aggregation: "active",
+      },
+      system: {
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        timestamp: new Date().toISOString(),
+      },
+    };
+
+    res.json({
+      success: true,
+      message: "System status retrieved",
+      data: status,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("❌ Error in /status endpoint:", error);
+    res.status(500).json({
+      success: false,
+      message: "System status check failed",
+      error: error.message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
 
 export default router;

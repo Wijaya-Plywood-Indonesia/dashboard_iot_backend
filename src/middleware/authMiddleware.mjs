@@ -108,7 +108,8 @@ export const authenticateUser = async (username, password) => {
       };
     } catch (dbError) {
       logger.error("Database error during authentication", {
-        username,
+        username:
+          typeof username === "string" ? username : "[Invalid Username Type]",
         error: dbError.message,
       });
       return {
@@ -117,7 +118,11 @@ export const authenticateUser = async (username, password) => {
       };
     }
   } catch (error) {
-    logger.error("Authentication error", { username, error: error.message });
+    logger.error("Authentication error", {
+      username:
+        typeof username === "string" ? username : "[Invalid Username Type]",
+      error: error.message,
+    });
     return {
       success: false,
       error: "Authentication failed",
